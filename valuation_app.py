@@ -714,6 +714,7 @@ def derive(raw: dict, fx: float = 1.0, edgar: dict = None, fcf_paste=None, avg_y
             ni_t = safe_float(info.get("profitMargins")) * rev_t
     rev_f = fy_inc(["Total Revenue"])
     d["rev_ttm"], d["rev_fy"], d["rev_fy_prev"] = rev_t, rev_f, fy_inc(["Total Revenue"], 1)
+    d["ni_ttm"], d["ni_fy"] = ni_t, fy_inc(ni_names)
     d["margins"] = {
         "Hrubá marža": (pct(gp_t, rev_t), pct(fy_inc(["Gross Profit"]), rev_f)),
         "Prevádzková marža": (pct(op_t, rev_t), pct(fy_inc(["Operating Income"]), rev_f)),
@@ -1300,9 +1301,19 @@ RUNNERS = {"dcf": run_dcf, "ddm": run_ddm, "excess": run_excess, "multiples": ru
 # ----------------------------------------------------------------------------
 # KRÍŽOVÁ KONTROLA (P/E, P/S, EV/EBITDA, FCF yield, dividenda, payout, dlh, rast, ROIC)
 # ----------------------------------------------------------------------------
-def build_cross_check(d: dict, price: float):
-    """Vráti (DataFrame s metrikami, počty valuačných signálov {'G','Y','R'}). Počíta z Yahoo / EDGAR dát."""
+def build_cross_check(d: dict, price: float, fv: dict = None):
+    """Vráti (DataFrame s metrikami, počty valuačných signálov {'G','Y','R'}).
+    Počíta z Yahoo / EDGAR dát; hodnoty z `fv` (ručne zadané z Finviz) majú prednosť."""
     rows, counts = [], {"G": 0, "Y": 0, "R": 0}
+    fv = fv or {}
+
+    def fpos(k):   # kladná hodnota z Finviz alebo NaN
+        v = fv.get(k, 0.0)
+        return float(v) if v and v > 0 else np.nan
+
+    def fany(k):   # ľubovoľná nenulová hodnota (zisk a marže môžu byť záporné)
+        v = fv.get(k, 0.0)
+        return float(v) if v else np.nan
 
     def add(metric, cur, ref, status, note="", sig=None):
         rows.append({"Metrika": metric, "Aktuálne": cur, "Referencia": ref,
@@ -1321,7 +1332,7 @@ def build_cross_check(d: dict, price: float):
         s_ = hm[col][hm[col] > 0].tail(max(avg_n.get(col, 0), 1))
         return f"rozsah {s_.min():.1f}–{s_.max():.1f} z {len(s_)} r." if len(s_) else ""
 
-    def vs_avg(label, cur, avg, col, fmt, count=True, manual=False):
+    def vs_avg(label, cur, avg, col, fmt, count=True, manual=False, src=""):
         if not (np.isfinite(cur) and np.isfinite(avg) and avg > 0):
             add(label, "n/a", "n/a", "⚪ nedostupné")
             return
@@ -1333,40 +1344,71 @@ def build_cross_check(d: dict, price: float):
         else:
             sig, txt = "R", "🔴 nad priemerom"
         ref = fmt.format(avg) + (" (vlastný priemer)" if manual else f" (priemer {avg_n.get(col, '?')} r.)")
-        add(label, fmt.format(cur), ref, f"{txt} ({(ratio - 1) * 100:+.0f} %)",
+        add(label, fmt.format(cur) + src, ref, f"{txt} ({(ratio - 1) * 100:+.0f} %)",
             "" if manual else hist_range(col), sig if count else None)
 
     eps, sps, ebitda = d["eps"], d["sps"], d["ebitda"]
+    if np.isfinite(fpos("eps")):
+        eps = fpos("eps")
     cur_pe = price / eps if np.isfinite(eps) and eps > 0 else np.nan
+    pe_fv = np.isfinite(fpos("pe"))
+    if pe_fv:
+        cur_pe = fpos("pe")
     cur_ps = price / sps if np.isfinite(sps) and sps > 0 else np.nan
+    ps_fv = np.isfinite(fpos("ps"))
+    if ps_fv:
+        cur_ps = fpos("ps")
     ev = mcap + d["debt"] - d["cash"] if np.isfinite(mcap) else np.nan
     cur_ev = ev / ebitda if np.isfinite(ev) and np.isfinite(ebitda) and ebitda > 0 else np.nan
 
     # P/E TTM a forward + PEG
-    vs_avg("P/E TTM (cena / EPS za 12 mes.)", cur_pe, d["avg_pe"], "P/E", "{:.1f}×", manual=d.get("avg_pe_manual", False))
+    vs_avg("P/E TTM (cena / EPS za 12 mes.)", cur_pe, d["avg_pe"], "P/E", "{:.1f}×",
+           manual=d.get("avg_pe_manual", False), src=" (Finviz)" if pe_fv else "")
     fwd_eps = d["fwd_eps"]
     fpe = d["fwd_pe"] if np.isfinite(d["fwd_pe"]) else (price / fwd_eps if np.isfinite(fwd_eps) and fwd_eps > 0 else np.nan)
+    fpe_fv = np.isfinite(fpos("fwd_pe"))
+    if fpe_fv:
+        fpe = fpos("fwd_pe")
     vs_avg("P/E forward (cena / očakávané EPS)", fpe, d["avg_pe"], "P/E", "{:.1f}×", count=False,
-           manual=d.get("avg_pe_manual", False))
+           manual=d.get("avg_pe_manual", False), src=" (Finviz)" if fpe_fv else "")
     growth = np.nan
     if d["fx"] == 1.0 and np.isfinite(fwd_eps) and fwd_eps > 0 and np.isfinite(eps) and eps > 0:
         growth = (fwd_eps / eps - 1) * 100
     own_peg = fpe / growth if np.isfinite(fpe) and np.isfinite(growth) and growth > 0 else np.nan
     yah_peg = d["peg_yahoo"] if np.isfinite(d["peg_yahoo"]) and d["peg_yahoo"] > 0 else np.nan
-    peg = own_peg if np.isfinite(own_peg) else yah_peg
+    peg_fv, eps5 = fpos("peg"), fpos("eps5")
+    if np.isfinite(peg_fv):
+        peg, ref, note = peg_fv, "Finviz (ručne)", "PEG z Finviz (rast = EPS next 5Y)."
+    elif np.isfinite(eps5) and np.isfinite(fpe):
+        peg, ref = fpe / eps5, f"forward P/E ÷ EPS next 5Y {eps5:.1f} % (Finviz)"
+        note = "Rast z 5-ročného odhadu analytikov (Finviz)."
+    elif np.isfinite(own_peg):
+        peg, ref = own_peg, f"vlastný: forward P/E ÷ rast EPS {growth:.1f} %"
+        note = "Rast = očakávané EPS vs. EPS za 12 mes. (len ~1 rok dopredu). Presnejší je PEG z Finviz."
+        if np.isfinite(yah_peg):
+            ref += f" · Yahoo: {yah_peg:.2f}"
+    elif np.isfinite(yah_peg):
+        peg, ref, note = yah_peg, "Yahoo (trailing PEG)", "Údaj z Yahoo."
+    else:
+        peg, ref, note = np.nan, "", ""
     if np.isfinite(peg):
         sig, txt = ("G", "🟢 ≤ 1 (lacné voči rastu)") if peg <= 1 else \
                    (("Y", "🟡 1–2 (primerané)") if peg <= 2 else ("R", "🔴 > 2 (drahé voči rastu)"))
-        ref = (f"vlastný: forward P/E ÷ rast EPS {growth:.1f} %" if np.isfinite(own_peg)
-               else "Yahoo (trailing PEG)")
-        if np.isfinite(own_peg) and np.isfinite(yah_peg):
-            ref += f" · Yahoo: {yah_peg:.2f}"
-        add("PEG", f"{peg:.2f}", ref, txt,
-            "Rast = očakávané EPS vs. EPS za 12 mes. (len ~1 rok dopredu), prahy 1 a 2 sú orientačné.", sig)
+        add("PEG", f"{peg:.2f}", ref, txt, note + " Prahy 1 a 2 sú orientačné.", sig)
     else:
         add("PEG", "n/a", "n/a", "⚪ nedostupný", "Chýba očakávaný rast EPS alebo je ≤ 0.")
 
-    vs_avg("P/S (cena / tržby na akciu)", cur_ps, d["avg_ps"], "P/S", "{:.2f}×")
+    vs_avg("P/S (cena / tržby na akciu)", cur_ps, d["avg_ps"], "P/S", "{:.2f}×", src=" (Finviz)" if ps_fv else "")
+    bv = d["bvps"]
+    cur_pb = fpos("pb") if np.isfinite(fpos("pb")) else (price / bv if np.isfinite(bv) and bv > 0 else np.nan)
+    if np.isfinite(cur_pb):
+        add("P/B (cena / účtovná hodnota)", f"{cur_pb:.2f}×" + (" (Finviz)" if np.isfinite(fpos("pb")) else ""),
+            "≤ 1,5 klasický Graham", "ℹ️ informatívne", "Pri firmách s vysokými nehmotnými aktívami je P/B zavádzajúci.")
+        if np.isfinite(cur_pe):
+            gn = cur_pe * cur_pb
+            st_ = "🟢 ≤ 22,5" if gn <= 22.5 else ("🟡 22,5–35" if gn <= 35 else "🔴 > 35")
+            add("Graham: P/E × P/B", f"{gn:.1f}", "≤ 22,5 (Graham)", st_,
+                "Grahamovo pravidlo pre defenzívneho investora; prísne pre kvalitné firmy.")
     vs_avg("EV/EBITDA", cur_ev, d["avg_ev"], "EV/EBITDA", "{:.1f}×")
 
     # FCF yield vs. výnos 10-ročného dlhopisu
@@ -1412,6 +1454,11 @@ def build_cross_check(d: dict, price: float):
                 add("Celkový payout (dividendy + čisté odkupy) / FCF", f"{tot:.0f} %", "≤ 80 % komfortné", st_,
                     "Ak je nad 100 %, firma vracia viac, než zarobí (financuje dlhom / hotovosťou).")
 
+    if np.isfinite(fpos("payout")):
+        p = fpos("payout")
+        st_ = "🟢 zdravé" if p <= 60 else ("🟡 vyššie" if p <= 80 else "🔴 vysoké")
+        add("Payout (Finviz)", f"{p:.0f} %", "≤ 60 % komfortné", st_, "Ručne zadané z Finviz.")
+
     # Spätný odkup akcií a vývoj počtu akcií
     if np.isfinite(bb) and np.isfinite(mcap) and mcap > 0:
         net = bb - iss
@@ -1428,25 +1475,35 @@ def build_cross_check(d: dict, price: float):
         add(f"Zmena počtu akcií (diluted, {d['share_label']})", f"{c:+.2f} % ročne", "≤ −0,5 % ročne = odkupuje",
             st_, "Z priemerného diluted počtu akcií.")
 
-    # Tržby a marže
-    if np.isfinite(d["rev_ttm"]):
+    # Tržby, zisk a marže
+    rev_ttm = fpos("sales") * M if np.isfinite(fpos("sales")) else d["rev_ttm"]
+    sales_tag = " (Finviz)" if np.isfinite(fpos("sales")) else ""
+    ni = fany("income") * M if np.isfinite(fany("income")) else d["ni_ttm"]
+    if np.isfinite(ni):
+        add("Čistý zisk (Income) TTM", f"{ni / M:,.0f} mil." + (" (Finviz)" if np.isfinite(fany("income")) else ""),
+            f"posledný FY: {d['ni_fy'] / M:,.0f} mil." if np.isfinite(d["ni_fy"]) else "n/a", "ℹ️ informatívne")
+    if np.isfinite(rev_ttm):
         g_fy = (d["rev_fy"] / d["rev_fy_prev"] - 1) * 100 if np.isfinite(d["rev_fy"]) and np.isfinite(d["rev_fy_prev"]) \
             and d["rev_fy_prev"] > 0 else np.nan
         st_ = "⚪ rast neznámy" if not np.isfinite(g_fy) else \
             ("🟢 rastie" if g_fy >= 3 else ("🟡 stagnuje" if g_fy >= 0 else "🔴 klesá"))
-        add("Tržby (Sales) TTM", f"{d['rev_ttm'] / M:,.0f} mil.",
+        add("Tržby (Sales) TTM", f"{rev_ttm / M:,.0f} mil." + sales_tag,
             f"posledný FY: {d['rev_fy'] / M:,.0f} mil." if np.isfinite(d["rev_fy"]) else "n/a",
             st_ + (f" ({g_fy:+.1f} % FY)" if np.isfinite(g_fy) else ""), "Rast posledného FY voči predchádzajúcemu.")
+    fv_margin = {"Hrubá marža": "gm", "Prevádzková marža": "om", "Čistá (ziskova) marža": "pm"}
     for label, (ttm_m, fy_m) in d["margins"].items():
+        tag = ""
+        if np.isfinite(fany(fv_margin[label])):
+            ttm_m, tag = fany(fv_margin[label]), " (Finviz)"
         if not np.isfinite(ttm_m):
             add(f"{label} (TTM)", "n/a", "n/a", "⚪ nedostupné")
             continue
         if np.isfinite(fy_m):
             dm = ttm_m - fy_m
             st_ = "🟢 zlepšuje sa" if dm >= 0.5 else ("🔴 zhoršuje sa" if dm <= -0.5 else "🟡 stabilná")
-            add(f"{label} (TTM)", f"{ttm_m:.1f} %", f"posledný FY: {fy_m:.1f} %", f"{st_} ({dm:+.1f} p.b.)")
+            add(f"{label} (TTM)", f"{ttm_m:.1f} %{tag}", f"posledný FY: {fy_m:.1f} %", f"{st_} ({dm:+.1f} p.b.)")
         else:
-            add(f"{label} (TTM)", f"{ttm_m:.1f} %", "n/a", "⚪ bez porovnania")
+            add(f"{label} (TTM)", f"{ttm_m:.1f} %{tag}", "n/a", "⚪ bez porovnania")
 
     if d["sector"] != "Financial Services" and np.isfinite(ebitda) and ebitda > 0:
         nde = (d["debt"] - d["cash"]) / ebitda
@@ -1660,7 +1717,20 @@ st.markdown("## 🔍 Krížová kontrola (P/E, FCF, dividenda, dlh)")
 st.caption("Počíta sa z dát Yahoo a SEC EDGAR (nie z tvojich override polí, okrem vlastného priemeru P/E "
            "z bočného panela). Počet rokov v priemere je v stĺpci Referencia, prahy hodnotenia sú orientačné. "
            "Slúži na kontrolu, či zónu z modelu potvrdzujú aj iné metriky.")
-cc_df, cc_cnt = build_cross_check(d, price)
+FV_FIELDS = [("pe", "P/E", 0.5, False), ("fwd_pe", "Forward P/E", 0.5, False), ("peg", "PEG", 0.05, False),
+             ("ps", "P/S", 0.1, False), ("pb", "P/B", 0.1, False), ("eps", "EPS (ttm)", 0.1, False),
+             ("eps5", "EPS next 5Y (%)", 0.5, False), ("payout", "Payout (%)", 1.0, False),
+             ("sales", "Sales (mil.)", 100.0, False), ("income", "Income (mil.)", 100.0, True),
+             ("gm", "Gross Margin (%)", 0.5, True), ("om", "Oper. Margin (%)", 0.5, True),
+             ("pm", "Profit Margin (%)", 0.5, True)]
+fv = {}
+with st.expander("✍️ Finviz – ručné hodnoty (0 = nepoužiť, použije sa Yahoo / EDGAR)", expanded=False):
+    st.caption("Prepíš čísla z finviz.com (stránka akcie). Platia len pre krížovú kontrolu. "
+               "Sales a Income zadaj v miliónoch; marže, payout a EPS next 5Y v %.")
+    cols = st.columns(4)
+    for i, (k, label, step, neg) in enumerate(FV_FIELDS):
+        fv[k] = num(cols[i % 4], label, 0.0, f"{tk}_fv_{k}", min_value=-1_000_000.0 if neg else 0.0, step=step)
+cc_df, cc_cnt = build_cross_check(d, price, fv)
 if cc_df.empty:
     st.info("Nepodarilo sa spočítať žiadnu kontrolnú metriku.")
 else:
@@ -1716,3 +1786,4 @@ st.table(pd.DataFrame({
 
 st.caption("⚠️ Nástroj slúži na vlastnú analýzu, nie je investičným odporúčaním. Dáta z yfinance sú neoficiálne "
            "a môžu byť neúplné – kľúčové vstupy (FCF 5y priemer, ROIC, diluted shares) over na roic.ai / macrotrends.net.")
+

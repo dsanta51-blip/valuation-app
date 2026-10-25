@@ -1786,4 +1786,3 @@ st.table(pd.DataFrame({
 
 st.caption("⚠️ Nástroj slúži na vlastnú analýzu, nie je investičným odporúčaním. Dáta z yfinance sú neoficiálne "
            "a môžu byť neúplné – kľúčové vstupy (FCF 5y priemer, ROIC, diluted shares) over na roic.ai / macrotrends.net.")
-

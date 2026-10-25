@@ -18,8 +18,11 @@ Novinky v2 (presnosť a bezpečnosť):
 import html
 from datetime import datetime
 
+import re
+
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -44,6 +47,12 @@ CAPEX_NAMES = ["Capital Expenditure", "Capital Expenditures"]
 SBC_NAMES = ["Stock Based Compensation"]
 CASH_NAMES = ["Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"]
 CYCLICAL_SECTORS = ("Energy", "Basic Materials", "Consumer Cyclical")
+BUYBACK_NAMES = ["Repurchase Of Capital Stock", "Common Stock Payments"]
+ISSUE_NAMES = ["Issuance Of Capital Stock", "Common Stock Issuance"]
+
+# SEC EDGAR vyžaduje identifikáciu v hlavičke User-Agent. ZMEŇ na svoje meno a e-mail.
+SEC_USER_AGENT = "ValuationApp personal-use CHANGE_ME@example.com"
+SEC_HEADERS = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 
 MODEL_LABELS = {
     "dcf": "DCF (Discounted Cash Flow)",
@@ -213,7 +222,7 @@ def load_ticker(symbol: str) -> dict:
 
     info = attempt(lambda: t.info, {}) or {}
     price = safe_float(attempt(lambda: t.fast_info["last_price"]))
-    hist = attempt(lambda: t.history(period="7y", auto_adjust=False), pd.DataFrame())
+    hist = attempt(lambda: t.history(period="12y", auto_adjust=False), pd.DataFrame())
     if hist is None:
         hist = pd.DataFrame()
     if not hist.empty:
@@ -284,43 +293,192 @@ def get_fx(fin: str, cur: str) -> float:
     return np.nan
 
 
-def hist_multiples(raw: dict, fx: float = 1.0) -> pd.DataFrame:
-    """Ročné P/E, P/S, EV/EBITDA z ceny ku koncu fiškálneho roka (yfinance dáva ~4 roky)."""
+# ----------------------------------------------------------------------------
+# SEC EDGAR (oficiálne XBRL dáta z 10-K, 10+ rokov histórie) a vložené dáta z macrotrends
+# ----------------------------------------------------------------------------
+def _annual_facts(facts: dict, tags: list, unit: str):
+    """Ročné hodnoty (10-K, obdobie ~1 rok) z XBRL tagov; chýbajúce roky sa dopĺňajú z ďalších tagov."""
+    result = None
+    for tag in tags:
+        node = facts.get("us-gaap", {}).get(tag)
+        items = node.get("units", {}).get(unit) if node else None
+        if not items:
+            continue
+        rows = {}
+        for it in items:
+            if it.get("form") not in ("10-K", "10-K/A", "10-KT"):
+                continue
+            end = it.get("end")
+            if not end or it.get("val") is None:
+                continue
+            if "start" in it:
+                try:
+                    dur = (pd.Timestamp(end) - pd.Timestamp(it["start"])).days
+                except Exception:
+                    continue
+                if not (340 <= dur <= 380):
+                    continue
+            filed = it.get("filed", "")
+            if end not in rows or filed > rows[end][1]:
+                rows[end] = (float(it["val"]), filed)
+        if rows:
+            ser = pd.Series({pd.Timestamp(k): v[0] for k, v in rows.items()}).sort_index()
+            result = ser if result is None else result.combine_first(ser)
+    return result
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _sec_cik(ticker: str) -> str:
+    r = requests.get("https://www.sec.gov/files/company_tickers.json", headers=SEC_HEADERS, timeout=20)
+    r.raise_for_status()
+    want = ticker.upper().replace(".", "-")
+    for v in r.json().values():
+        if str(v.get("ticker", "")).upper().replace(".", "-") == want:
+            return f"{int(v['cik_str']):010d}"
+    return ""
+
+
+@st.cache_data(ttl=86400, show_spinner="Sťahujem históriu zo SEC EDGAR…")
+def _sec_facts(cik: str) -> dict:
+    r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=SEC_HEADERS, timeout=40)
+    r.raise_for_status()
+    facts = r.json().get("facts", {})
+    return dict(
+        ocf=_annual_facts(facts, ["NetCashProvidedByUsedInOperatingActivities",
+                                  "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"], "USD"),
+        capex=_annual_facts(facts, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets",
+                                    "PaymentsForCapitalImprovements"], "USD"),
+        sbc=_annual_facts(facts, ["ShareBasedCompensation"], "USD"),
+        eps=_annual_facts(facts, ["EarningsPerShareDiluted"], "USD/shares"),
+        revenue=_annual_facts(facts, ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                                      "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"], "USD"),
+        shares=_annual_facts(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], "shares"),
+        buyback=_annual_facts(facts, ["PaymentsForRepurchaseOfCommonStock"], "USD"),
+    )
+
+
+def load_edgar(ticker: str):
+    """Dáta zo SEC EDGAR pre US firmy (10-K). Pri akejkoľvek chybe vráti None a appka použije Yahoo."""
+    try:
+        cik = _sec_cik(ticker)
+        if not cik:
+            return None
+        out = _sec_facts(cik)
+        if out.get("ocf") is None and out.get("eps") is None:
+            return None
+        out = dict(out)
+        out["cik"] = cik
+        return out
+    except Exception:
+        return None
+
+
+def _parse_num(rest: str):
+    """Číslo z textu typu '8 200,00', '7,531.00', '$8.2B', '(1 200)'. Hodnoty považuje za milióny."""
+    s = rest.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2212", "-")
+    m = re.search(r"\d+(?:[ ]\d{3})*(?:[.,]\d+)*", s)
+    if not m:
+        return None
+    tok = m.group(0).replace(" ", "")
+    if "," in tok and "." in tok:
+        tok = tok.replace(".", "").replace(",", ".") if tok.rfind(",") > tok.rfind(".") else tok.replace(",", "")
+    elif "," in tok:
+        tok = tok.replace(",", ".") if re.search(r",\d{1,2}$", tok) else tok.replace(",", "")
+    elif tok.count(".") > 1 or re.fullmatch(r"\d{1,3}(\.\d{3})+", tok):
+        tok = tok.replace(".", "")
+    try:
+        v = float(tok)
+    except ValueError:
+        return None
+    suf = s[m.end():m.end() + 3].strip().upper()[:1]
+    v *= {"B": 1000.0, "T": 1_000_000.0}.get(suf, 1.0)
+    before = s[:m.start()].strip()
+    if before.endswith(("-", "(")):
+        v = -v
+    return v
+
+
+def parse_pasted_series(text: str):
+    """Riadky 'rok hodnota' (napr. skopírované z macrotrends) → Series (index = 31.12. daného roka, mil.)."""
+    if not text or not text.strip():
+        return None
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*((?:19|20)\d{2})\b(.*)$", line)
+        if not m:
+            continue
+        v = _parse_num(m.group(2))
+        if v is not None:
+            out[pd.Timestamp(year=int(m.group(1)), month=12, day=31)] = v
+    return pd.Series(out).sort_index() if out else None
+
+
+def hist_multiples(raw: dict, fx: float = 1.0, edgar: dict = None) -> pd.DataFrame:
+    """Ročné P/E, P/S, EV/EBITDA z ceny ku koncu fiškálneho roka.
+    P/E a P/S berie zo SEC EDGAR (10+ rokov), ak je dostupný; EV/EBITDA a doplnenie z Yahoo (~4 roky)."""
     inc, bs, hist = raw["inc"], raw["bs"], raw["hist"]
-    eps = _series(inc, ["Diluted EPS"])
-    rev = _series(inc, ["Total Revenue"])
-    ebitda = _series(inc, ["EBITDA", "Normalized EBITDA"])
-    sh = _series(inc, ["Diluted Average Shares"])
-    debt = _series(bs, ["Total Debt"])
-    cash = _series(bs, CASH_NAMES)
-    if eps is None or hist is None or hist.empty:
-        return pd.DataFrame()
+    have_px = hist is not None and not hist.empty
 
     def g(s, dt, mult=1.0):
         if s is None or dt not in s.index:
             return np.nan
         return safe_float(s.loc[dt]) * mult
 
-    rows = []
-    for dt in eps.index:
-        px = hist["Close"].loc[:dt]
-        if px.empty:
-            continue
-        p = float(px.iloc[-1])
-        e, rv, eb = g(eps, dt, fx), g(rev, dt, fx), g(ebitda, dt, fx)
-        s_ = g(sh, dt)
-        mcap = p * s_
-        ev = mcap + g(debt, dt, fx) - g(cash, dt, fx)
-        rows.append({
-            "Rok": dt.year, "Cena (koniec FY)": p,
-            "P/E": p / e if e > 0 else np.nan,
-            "P/S": mcap / rv if rv > 0 else np.nan,
-            "EV/EBITDA": ev / eb if eb > 0 else np.nan,
-        })
-    return pd.DataFrame(rows).set_index("Rok") if rows else pd.DataFrame()
+    hm_y = pd.DataFrame()
+    eps = _series(inc, ["Diluted EPS"])
+    if eps is not None and have_px:
+        rev = _series(inc, ["Total Revenue"])
+        ebitda = _series(inc, ["EBITDA", "Normalized EBITDA"])
+        sh = _series(inc, ["Diluted Average Shares"])
+        debt = _series(bs, ["Total Debt"])
+        cash = _series(bs, CASH_NAMES)
+        rows = []
+        for dt in eps.index:
+            px = hist["Close"].loc[:dt]
+            if px.empty:
+                continue
+            p = float(px.iloc[-1])
+            e, rv, eb = g(eps, dt, fx), g(rev, dt, fx), g(ebitda, dt, fx)
+            s_ = g(sh, dt)
+            mcap = p * s_
+            ev = mcap + g(debt, dt, fx) - g(cash, dt, fx)
+            rows.append({
+                "Rok": dt.year, "Cena (koniec FY)": p,
+                "P/E": p / e if e > 0 else np.nan,
+                "P/S": mcap / rv if rv > 0 else np.nan,
+                "EV/EBITDA": ev / eb if eb > 0 else np.nan,
+            })
+        if rows:
+            hm_y = pd.DataFrame(rows).set_index("Rok")
+            hm_y = hm_y[~hm_y.index.duplicated(keep="last")]
+
+    hm_e = pd.DataFrame()
+    if edgar and edgar.get("eps") is not None and have_px:
+        e_eps, e_rev, e_sh = edgar["eps"], edgar.get("revenue"), edgar.get("shares")
+        rows = []
+        for dt in e_eps.index:
+            px = hist["Close"].loc[:dt]
+            if px.empty:
+                continue
+            p = float(px.iloc[-1])
+            e = float(e_eps.loc[dt])
+            ps = np.nan
+            if e_rev is not None and e_sh is not None and dt in e_rev.index and dt in e_sh.index and e_rev.loc[dt] > 0:
+                ps = p * float(e_sh.loc[dt]) / float(e_rev.loc[dt])
+            rows.append({"Rok": dt.year, "Cena (koniec FY)": p, "P/E": p / e if e > 0 else np.nan, "P/S": ps})
+        if rows:
+            hm_e = pd.DataFrame(rows).set_index("Rok")
+            hm_e = hm_e[~hm_e.index.duplicated(keep="last")]
+
+    if hm_e.empty:
+        return hm_y
+    if hm_y.empty:
+        return hm_e
+    return hm_e.combine_first(hm_y).sort_index()
 
 
-def derive(raw: dict, fx: float = 1.0) -> dict:
+def derive(raw: dict, fx: float = 1.0, edgar: dict = None, fcf_paste=None, avg_years: int = 5,
+           pe_override: float = np.nan) -> dict:
     """Z yfinance tabuliek odvodí všetky fundamentálne vstupy. Sumy výkazov sú prepočítané kurzom fx."""
     info = raw["info"]
     d = {"info": info, "price": raw["price"], "symbol": raw["symbol"], "fx": fx,
@@ -348,8 +506,26 @@ def derive(raw: dict, fx: float = 1.0) -> dict:
         fa = pd.DataFrame(columns=["OCF", "CapEx", "FCF"], dtype=float)
     fa = fa[["OCF", "CapEx", "FCF"]].astype(float)
     fa["SBC"] = sbc.reindex(fa.index).abs() if sbc is not None else np.nan
+    fcf_src = "Yahoo"
+    if edgar and edgar.get("ocf") is not None and edgar.get("capex") is not None:
+        e = pd.DataFrame({"OCF": edgar["ocf"], "CapEx": edgar["capex"].abs()}).dropna()
+        if len(e) >= 3:
+            e["FCF"] = e["OCF"] - e["CapEx"]
+            e["SBC"] = edgar["sbc"].abs().reindex(e.index) if edgar.get("sbc") is not None else np.nan
+            e = e[["OCF", "CapEx", "FCF", "SBC"]].astype(float)
+            for dt in fa.index:   # roky, ktoré v EDGAR ešte nie sú (čerstvý 10-K), doplní Yahoo
+                if not any(abs((dt - x).days) <= 20 for x in e.index):
+                    e.loc[dt] = fa.loc[dt, ["OCF", "CapEx", "FCF", "SBC"]].values
+            fa = e.sort_index()
+            fcf_src = "SEC EDGAR (+ Yahoo pre najnovší rok)"
     fa = fa * fx
+    if fcf_paste is not None and len(fcf_paste) >= 3:
+        fa = pd.DataFrame({"OCF": np.nan, "CapEx": np.nan, "FCF": fcf_paste.astype(float) * M,
+                           "SBC": np.nan}).sort_index()
+        fcf_src = "Vložené z macrotrends (mil. v mene ceny)"
     fa["FCF_SBC"] = fa["FCF"] - fa["SBC"].fillna(0)
+    d["fcf_source"] = fcf_src
+    d["edgar_ok"] = bool(edgar)
     d["sbc_available"] = bool(fa["SBC"].notna().any())
     d["fcf_annual"] = fa
 
@@ -377,6 +553,10 @@ def derive(raw: dict, fx: float = 1.0) -> dict:
         if len(fa):
             o["Priemer 3 roky"] = float(fa[col].tail(3).mean()) / M
             o["Priemer 5 rokov (dostupné)"] = float(fa[col].tail(5).mean()) / M
+            if len(fa) >= 7:
+                o["Priemer 7 rokov"] = float(fa[col].tail(7).mean()) / M
+            if len(fa) >= 10:
+                o["Priemer 10 rokov"] = float(fa[col].tail(10).mean()) / M
         return o
 
     d["fcf_options"] = build_opts("FCF", ttm)
@@ -451,16 +631,24 @@ def derive(raw: dict, fx: float = 1.0) -> dict:
     d["ebitda"] = eb * fx
 
     # --- Historické násobky
-    hm = hist_multiples(raw, fx)
+    hm = hist_multiples(raw, fx, edgar)
     d["hist_mult"] = hm
+    d["hist_source"] = ("SEC EDGAR (EPS, tržby) + Yahoo (cena, EV/EBITDA)" if edgar and edgar.get("eps") is not None
+                         else "Yahoo")
+
+    d["avg_n"] = {}
 
     def avg(col):
         if hm.empty or col not in hm:
             return np.nan
-        s = hm[col][hm[col] > 0]
+        s = hm[col][hm[col] > 0].tail(avg_years)
+        d["avg_n"][col] = len(s)
         return float(s.mean()) if len(s) else np.nan
 
     d["avg_pe"], d["avg_ps"], d["avg_ev"] = avg("P/E"), avg("P/S"), avg("EV/EBITDA")
+    d["avg_pe_manual"] = False
+    if np.isfinite(pe_override) and pe_override > 0:
+        d["avg_pe"], d["avg_pe_manual"] = float(pe_override), True
 
     # --- ROIC (orientačne): NOPAT / Invested Capital
     ebit = _series(raw["inc"], ["EBIT", "Operating Income"])
@@ -495,6 +683,78 @@ def derive(raw: dict, fx: float = 1.0) -> dict:
             d["fcf_cagr"] = ((fs.iloc[-1] / fs.iloc[0]) ** (1 / yrs) - 1) * 100
             d["fcf_cagr_label"] = f"{fs.index[0].year}–{fs.index[-1].year}"
 
+    # --- Tržby a marže: TTM (súčet 4 kvartálov) vs. posledný fiškálny rok
+    def ttm_inc(names):
+        s_ = _series(raw["qinc"], names)
+        if s_ is not None and len(s_.dropna()) >= 4:
+            return float(s_.dropna().tail(4).sum()) * fx
+        return np.nan
+
+    def fy_inc(names, back=0):
+        s_ = _series(raw["inc"], names)
+        if s_ is None:
+            return np.nan
+        s_ = s_.dropna()
+        return float(s_.iloc[-1 - back]) * fx if len(s_) > back else np.nan
+
+    def pct(a, b):
+        return a / b * 100 if np.isfinite(a) and np.isfinite(b) and b > 0 else np.nan
+
+    ni_names = ["Net Income", "Net Income Common Stockholders"]
+    rev_t = ttm_inc(["Total Revenue"])
+    if not np.isfinite(rev_t):
+        rev_t = safe_float(info.get("totalRevenue")) * fx
+    gp_t, op_t, ni_t = ttm_inc(["Gross Profit"]), ttm_inc(["Operating Income"]), ttm_inc(ni_names)
+    if np.isfinite(rev_t):   # záloha: marže z Yahoo info
+        if not np.isfinite(gp_t):
+            gp_t = safe_float(info.get("grossMargins")) * rev_t
+        if not np.isfinite(op_t):
+            op_t = safe_float(info.get("operatingMargins")) * rev_t
+        if not np.isfinite(ni_t):
+            ni_t = safe_float(info.get("profitMargins")) * rev_t
+    rev_f = fy_inc(["Total Revenue"])
+    d["rev_ttm"], d["rev_fy"], d["rev_fy_prev"] = rev_t, rev_f, fy_inc(["Total Revenue"], 1)
+    d["margins"] = {
+        "Hrubá marža": (pct(gp_t, rev_t), pct(fy_inc(["Gross Profit"]), rev_f)),
+        "Prevádzková marža": (pct(op_t, rev_t), pct(fy_inc(["Operating Income"]), rev_f)),
+        "Čistá (ziskova) marža": (pct(ni_t, rev_t), pct(fy_inc(ni_names), rev_f)),
+    }
+
+    # --- Spätný odkup akcií a vývoj počtu akcií
+    def ttm_cf(names):
+        s_ = _series(raw["qcf"], names)
+        if s_ is not None and len(s_.dropna()) >= 4:
+            return float(s_.dropna().tail(4).sum())
+        return _last(_series(raw["cf"], names))
+
+    bb, iss = ttm_cf(BUYBACK_NAMES), ttm_cf(ISSUE_NAMES)
+    if not np.isfinite(bb) and edgar and edgar.get("buyback") is not None:
+        bb = _last(edgar["buyback"])
+    d["buyback_ttm"] = abs(bb) * fx if np.isfinite(bb) else np.nan
+    d["issuance_ttm"] = abs(iss) * fx if np.isfinite(iss) else 0.0
+
+    sh_h, sh_src = None, ""
+    if edgar and edgar.get("shares") is not None and len(edgar["shares"].dropna()) >= 3:
+        sh_h, sh_src = edgar["shares"].dropna(), "SEC EDGAR"
+    else:
+        s_ = _series(raw["inc"], ["Diluted Average Shares"])
+        if s_ is not None and len(s_.dropna()) >= 2:
+            sh_h, sh_src = s_.dropna(), "Yahoo"
+    d["share_cagr"], d["share_label"] = np.nan, ""
+    if sh_h is not None:
+        sh_h = sh_h.tail(avg_years + 1)
+        if len(sh_h) >= 2 and sh_h.iloc[0] > 0 and sh_h.iloc[-1] > 0:
+            yrs = (sh_h.index[-1] - sh_h.index[0]).days / 365.25
+            if yrs > 0:
+                d["share_cagr"] = ((sh_h.iloc[-1] / sh_h.iloc[0]) ** (1 / yrs) - 1) * 100
+                d["share_label"] = f"{sh_h.index[0].year}–{sh_h.index[-1].year}, {sh_src}"
+
+    # --- Forward P/E a PEG (Yahoo)
+    d["fwd_eps"] = safe_float(info.get("forwardEps"))
+    d["fwd_pe"] = safe_float(info.get("forwardPE"))
+    peg = safe_float(info.get("trailingPegRatio"))
+    d["peg_yahoo"] = peg if np.isfinite(peg) else safe_float(info.get("pegRatio"))
+
     # --- Default growth (orientačný, investor ho má skontrolovať)
     gr = safe_float(info.get("earningsGrowth"))
     if np.isnan(gr):
@@ -525,6 +785,11 @@ def data_quality(d: dict, price: float) -> list:
     """Zoznam (úroveň, správa) – kontrola, či sú načítané dáta použiteľné a konzistentné."""
     out = []
     fa = d["fcf_annual"]
+    out.append(("info", f"Zdroj ročného FCF: {d['fcf_source']} ({len(fa)} rokov) · zdroj násobkov: {d['hist_source']}."))
+    if not d["edgar_ok"] and d["currency"] == "USD" and d["fcf_source"] == "Yahoo":
+        out.append(("warning", "História zo SEC EDGAR sa nenačítala (nie je to US 10-K firma, výpadok, alebo SEC "
+                               "zablokovala požiadavku – skontroluj SEC_USER_AGENT v kóde). Použité sú len ~4 roky z Yahoo. "
+                               "Môžeš vložiť ročné FCF z macrotrends v bočnom paneli."))
     if fa.empty or fa["FCF"].dropna().empty:
         out.append(("warning", "Chýbajú ročné cash-flow dáta – FCF a ďalšie vstupy zadaj ručne podľa roic.ai / macrotrends."))
     else:
@@ -1036,7 +1301,7 @@ RUNNERS = {"dcf": run_dcf, "ddm": run_ddm, "excess": run_excess, "multiples": ru
 # KRÍŽOVÁ KONTROLA (P/E, P/S, EV/EBITDA, FCF yield, dividenda, payout, dlh, rast, ROIC)
 # ----------------------------------------------------------------------------
 def build_cross_check(d: dict, price: float):
-    """Vráti (DataFrame s metrikami, počty valuačných signálov {'G','Y','R'}). Počíta z Yahoo dát."""
+    """Vráti (DataFrame s metrikami, počty valuačných signálov {'G','Y','R'}). Počíta z Yahoo / EDGAR dát."""
     rows, counts = [], {"G": 0, "Y": 0, "R": 0}
 
     def add(metric, cur, ref, status, note="", sig=None):
@@ -1048,14 +1313,15 @@ def build_cross_check(d: dict, price: float):
     shares = d["shares"]
     mcap = price * shares if np.isfinite(shares) and shares > 0 else np.nan
     hm = d["hist_mult"]
+    avg_n = d.get("avg_n", {})
 
     def hist_range(col):
         if hm.empty or col not in hm:
             return ""
-        s = hm[col][hm[col] > 0]
-        return f"rozsah {s.min():.1f}–{s.max():.1f} z {len(s)} r." if len(s) else ""
+        s_ = hm[col][hm[col] > 0].tail(max(avg_n.get(col, 0), 1))
+        return f"rozsah {s_.min():.1f}–{s_.max():.1f} z {len(s_)} r." if len(s_) else ""
 
-    def vs_avg(label, cur, avg, col, fmt):
+    def vs_avg(label, cur, avg, col, fmt, count=True, manual=False):
         if not (np.isfinite(cur) and np.isfinite(avg) and avg > 0):
             add(label, "n/a", "n/a", "⚪ nedostupné")
             return
@@ -1066,8 +1332,9 @@ def build_cross_check(d: dict, price: float):
             sig, txt = "Y", "🟡 okolo priemeru"
         else:
             sig, txt = "R", "🔴 nad priemerom"
-        add(label, fmt.format(cur), fmt.format(avg) + " (priemer)", f"{txt} ({(ratio - 1) * 100:+.0f} %)",
-            hist_range(col), sig)
+        ref = fmt.format(avg) + (" (vlastný priemer)" if manual else f" (priemer {avg_n.get(col, '?')} r.)")
+        add(label, fmt.format(cur), ref, f"{txt} ({(ratio - 1) * 100:+.0f} %)",
+            "" if manual else hist_range(col), sig if count else None)
 
     eps, sps, ebitda = d["eps"], d["sps"], d["ebitda"]
     cur_pe = price / eps if np.isfinite(eps) and eps > 0 else np.nan
@@ -1075,10 +1342,34 @@ def build_cross_check(d: dict, price: float):
     ev = mcap + d["debt"] - d["cash"] if np.isfinite(mcap) else np.nan
     cur_ev = ev / ebitda if np.isfinite(ev) and np.isfinite(ebitda) and ebitda > 0 else np.nan
 
-    vs_avg("P/E (cena / EPS)", cur_pe, d["avg_pe"], "P/E", "{:.1f}×")
+    # P/E TTM a forward + PEG
+    vs_avg("P/E TTM (cena / EPS za 12 mes.)", cur_pe, d["avg_pe"], "P/E", "{:.1f}×", manual=d.get("avg_pe_manual", False))
+    fwd_eps = d["fwd_eps"]
+    fpe = d["fwd_pe"] if np.isfinite(d["fwd_pe"]) else (price / fwd_eps if np.isfinite(fwd_eps) and fwd_eps > 0 else np.nan)
+    vs_avg("P/E forward (cena / očakávané EPS)", fpe, d["avg_pe"], "P/E", "{:.1f}×", count=False,
+           manual=d.get("avg_pe_manual", False))
+    growth = np.nan
+    if d["fx"] == 1.0 and np.isfinite(fwd_eps) and fwd_eps > 0 and np.isfinite(eps) and eps > 0:
+        growth = (fwd_eps / eps - 1) * 100
+    own_peg = fpe / growth if np.isfinite(fpe) and np.isfinite(growth) and growth > 0 else np.nan
+    yah_peg = d["peg_yahoo"] if np.isfinite(d["peg_yahoo"]) and d["peg_yahoo"] > 0 else np.nan
+    peg = own_peg if np.isfinite(own_peg) else yah_peg
+    if np.isfinite(peg):
+        sig, txt = ("G", "🟢 ≤ 1 (lacné voči rastu)") if peg <= 1 else \
+                   (("Y", "🟡 1–2 (primerané)") if peg <= 2 else ("R", "🔴 > 2 (drahé voči rastu)"))
+        ref = (f"vlastný: forward P/E ÷ rast EPS {growth:.1f} %" if np.isfinite(own_peg)
+               else "Yahoo (trailing PEG)")
+        if np.isfinite(own_peg) and np.isfinite(yah_peg):
+            ref += f" · Yahoo: {yah_peg:.2f}"
+        add("PEG", f"{peg:.2f}", ref, txt,
+            "Rast = očakávané EPS vs. EPS za 12 mes. (len ~1 rok dopredu), prahy 1 a 2 sú orientačné.", sig)
+    else:
+        add("PEG", "n/a", "n/a", "⚪ nedostupný", "Chýba očakávaný rast EPS alebo je ≤ 0.")
+
     vs_avg("P/S (cena / tržby na akciu)", cur_ps, d["avg_ps"], "P/S", "{:.2f}×")
     vs_avg("EV/EBITDA", cur_ev, d["avg_ev"], "EV/EBITDA", "{:.1f}×")
 
+    # FCF yield vs. výnos 10-ročného dlhopisu
     ttm = d["fcf_options"].get(TTM_KEY, np.nan)
     if np.isfinite(ttm) and np.isfinite(mcap) and mcap > 0:
         fcf_y = ttm * M / mcap * 100
@@ -1092,7 +1383,9 @@ def build_cross_check(d: dict, price: float):
         else:
             add("FCF yield (FCF / market cap)", f"{fcf_y:.2f} %", "n/a", "⚪ výnos dlhopisu nedostupný")
 
+    # Dividenda a payout
     div = d["div_rate"]
+    bb, iss = d["buyback_ttm"], d["issuance_ttm"]
     if np.isfinite(div) and div > 0:
         cur_dy = div / price * 100
         avg_dy = d["avg_div_yield"]
@@ -1113,6 +1406,47 @@ def build_cross_check(d: dict, price: float):
             st_ = "🟢 zdravé" if p <= 60 else ("🟡 vyššie" if p <= 80 else "🔴 vysoké")
             add("Payout ratio (dividendy / FCF)", f"{p:.0f} %", "≤ 60 % komfortné", st_,
                 "Čím vyšší, tým menej priestoru na zvyšovanie dividendy.")
+            if np.isfinite(bb):
+                tot = (div * shares + max(bb - iss, 0)) / (ttm * M) * 100
+                st_ = "🟢 zdravé" if tot <= 80 else ("🟡 vyššie" if tot <= 100 else "🔴 nad FCF")
+                add("Celkový payout (dividendy + čisté odkupy) / FCF", f"{tot:.0f} %", "≤ 80 % komfortné", st_,
+                    "Ak je nad 100 %, firma vracia viac, než zarobí (financuje dlhom / hotovosťou).")
+
+    # Spätný odkup akcií a vývoj počtu akcií
+    if np.isfinite(bb) and np.isfinite(mcap) and mcap > 0:
+        net = bb - iss
+        ny = net / mcap * 100
+        st_ = "🟢 aktívne odkupuje" if ny >= 1 else ("🟡 malý čistý odkup" if ny >= 0 else "🔴 čistá emisia akcií")
+        add("Spätný odkup akcií (TTM)", f"{bb / M:,.0f} mil. ({bb / mcap * 100:.1f} % mcap)",
+            f"čistý po emisii: {net / M:,.0f} mil. ({ny:+.1f} %)", st_,
+            "Odkupy mínus nové emisie akcií (napr. zamestnanecké programy).")
+    else:
+        add("Spätný odkup akcií (TTM)", "n/a", "n/a", "⚪ nedostupné")
+    if np.isfinite(d["share_cagr"]):
+        c = d["share_cagr"]
+        st_ = "🟢 počet akcií klesá" if c <= -0.5 else ("🟡 stabilný" if c < 0.5 else "🔴 riedenie (počet rastie)")
+        add(f"Zmena počtu akcií (diluted, {d['share_label']})", f"{c:+.2f} % ročne", "≤ −0,5 % ročne = odkupuje",
+            st_, "Z priemerného diluted počtu akcií.")
+
+    # Tržby a marže
+    if np.isfinite(d["rev_ttm"]):
+        g_fy = (d["rev_fy"] / d["rev_fy_prev"] - 1) * 100 if np.isfinite(d["rev_fy"]) and np.isfinite(d["rev_fy_prev"]) \
+            and d["rev_fy_prev"] > 0 else np.nan
+        st_ = "⚪ rast neznámy" if not np.isfinite(g_fy) else \
+            ("🟢 rastie" if g_fy >= 3 else ("🟡 stagnuje" if g_fy >= 0 else "🔴 klesá"))
+        add("Tržby (Sales) TTM", f"{d['rev_ttm'] / M:,.0f} mil.",
+            f"posledný FY: {d['rev_fy'] / M:,.0f} mil." if np.isfinite(d["rev_fy"]) else "n/a",
+            st_ + (f" ({g_fy:+.1f} % FY)" if np.isfinite(g_fy) else ""), "Rast posledného FY voči predchádzajúcemu.")
+    for label, (ttm_m, fy_m) in d["margins"].items():
+        if not np.isfinite(ttm_m):
+            add(f"{label} (TTM)", "n/a", "n/a", "⚪ nedostupné")
+            continue
+        if np.isfinite(fy_m):
+            dm = ttm_m - fy_m
+            st_ = "🟢 zlepšuje sa" if dm >= 0.5 else ("🔴 zhoršuje sa" if dm <= -0.5 else "🟡 stabilná")
+            add(f"{label} (TTM)", f"{ttm_m:.1f} %", f"posledný FY: {fy_m:.1f} %", f"{st_} ({dm:+.1f} p.b.)")
+        else:
+            add(f"{label} (TTM)", f"{ttm_m:.1f} %", "n/a", "⚪ bez porovnania")
 
     if d["sector"] != "Financial Services" and np.isfinite(ebitda) and ebitda > 0:
         nde = (d["debt"] - d["cash"]) / ebitda
@@ -1123,7 +1457,7 @@ def build_cross_check(d: dict, price: float):
         c = d["fcf_cagr"]
         st_ = "🟢 rastie" if c >= 3 else ("🟡 stagnuje" if c >= 0 else "🔴 klesá")
         add(f"FCF CAGR ({d['fcf_cagr_label']})", f"{c:+.1f} % ročne", "≥ 3 % rastie", st_,
-            "Počítané len z dostupných ročných dát Yahoo.")
+            f"Zdroj: {d['fcf_source']}.")
     if np.isfinite(d["roic"]):
         r_ = d["roic"]
         st_ = "🟢 silný" if r_ >= 15 else ("🟡 priemerný" if r_ >= 8 else "🔴 slabý")
@@ -1143,6 +1477,14 @@ with st.sidebar:
     ticker = st.text_input("Ticker (napr. AAPL, MSFT, SAP.DE)", value="AAPL").strip().upper()
     weight = st.number_input("Podiel pozície v portfóliu (%)", min_value=0.0, max_value=100.0,
                              value=5.0, step=0.5)
+    st.divider()
+    st.markdown("**Historické dáta**")
+    avg_years = st.selectbox("Priemer násobkov za posledných (rokov)", [5, 6, 7, 10], index=0, key="avg_years")
+    pe_ovr = st.number_input("Vlastný priemer P/E (napr. z macrotrends), 0 = nepoužiť", min_value=0.0,
+                             value=0.0, step=0.5, key=f"{ticker}_pe_ovr")
+    paste_txt = st.text_area("Vlož ročné FCF z macrotrends (rok a hodnota v mil.)", key=f"{ticker}_paste",
+                             height=110, placeholder="2025 8 200,00\n2024 7 531,00\n2023 8 122,00\n...",
+                             help="Každý riadok: rok a hodnota. Nahradí FCF z EDGAR / Yahoo pre priemery.")
     if st.button("🔄 Obnoviť dáta z Yahoo"):
         st.cache_data.clear()
         st.rerun()
@@ -1177,7 +1519,16 @@ if _fin and _cur and _fin != _cur and _cur not in ("ILA", "ZAc"):
                              step=0.01, format="%.4f", key=f"{tk}_fx",
                              help="Sumy z výkazov (FCF, dlh, cash, EPS, EBITDA) sa vynásobia týmto kurzom.")
 
-d = derive(raw, fx)
+edgar = None
+if _cur == "USD" and _fin in ("USD", ""):
+    edgar = load_edgar(tk)
+fcf_paste = parse_pasted_series(paste_txt)
+if paste_txt and paste_txt.strip() and (fcf_paste is None or len(fcf_paste) < 3):
+    with st.sidebar:
+        st.warning("Vložené dáta sa nepodarilo prečítať (treba aspoň 3 riadky v tvare „rok hodnota“).")
+    fcf_paste = None
+d = derive(raw, fx, edgar=edgar, fcf_paste=fcf_paste, avg_years=int(avg_years),
+           pe_override=pe_ovr if pe_ovr > 0 else np.nan)
 
 h1, h2, h3, h4 = st.columns([3, 1, 1, 1])
 h1.subheader(f"{d['name']} ({tk})")
@@ -1200,7 +1551,8 @@ keys = list(MODEL_LABELS.keys())
 model = st.selectbox("Valuačný model", keys, index=keys.index(rec), format_func=lambda k: MODEL_LABELS[k])
 st.caption(f"Odporúčanie aplikácie: **{MODEL_LABELS[rec]}** – {reason}")
 
-with st.expander("🔎 Zdrojové dáta z Yahoo Finance (na kontrolu)", expanded=False):
+with st.expander("🔎 Zdrojové dáta (Yahoo, SEC EDGAR – na kontrolu)", expanded=False):
+    st.caption(f"Zdroj FCF: {d['fcf_source']} · zdroj násobkov: {d['hist_source']} · priemer za {int(avg_years)} r.")
     fa = d["fcf_annual"]
     if len(fa):
         show = (fa[["OCF", "CapEx", "FCF", "SBC"]] / M).round(1)
@@ -1305,9 +1657,9 @@ for n in result["notes"]:
 # --- KRÍŽOVÁ KONTROLA ------------------------------------------------------
 st.divider()
 st.markdown("## 🔍 Krížová kontrola (P/E, FCF, dividenda, dlh)")
-st.caption("Počíta sa z dát Yahoo (nie z tvojich override polí). Priemery sú len z dostupných ročných dát "
-           "(~4 roky), prahy hodnotenia sú orientačné. Slúži na kontrolu, či zónu z modelu potvrdzujú aj "
-           "iné metriky.")
+st.caption("Počíta sa z dát Yahoo a SEC EDGAR (nie z tvojich override polí, okrem vlastného priemeru P/E "
+           "z bočného panela). Počet rokov v priemere je v stĺpci Referencia, prahy hodnotenia sú orientačné. "
+           "Slúži na kontrolu, či zónu z modelu potvrdzujú aj iné metriky.")
 cc_df, cc_cnt = build_cross_check(d, price)
 if cc_df.empty:
     st.info("Nepodarilo sa spočítať žiadnu kontrolnú metriku.")
@@ -1316,7 +1668,7 @@ else:
     g, y, rd = cc_cnt["G"], cc_cnt["Y"], cc_cnt["R"]
     total = g + y + rd
     if total:
-        st.markdown(f"**Valuačné signály** (P/E, P/S, EV/EBITDA, FCF yield, dividendový výnos): "
+        st.markdown(f"**Valuačné signály** (P/E TTM, PEG, P/S, EV/EBITDA, FCF yield, dividendový výnos): "
                     f"🟢 {g} lacnejšie · 🟡 {y} neutrálne · 🔴 {rd} drahšie")
     if total >= 3:
         if z["key"] in ("PARTIAL", "EXIT") and g > rd:

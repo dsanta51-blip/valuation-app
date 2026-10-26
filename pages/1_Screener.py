@@ -234,6 +234,10 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
             why.append(f"ocenenie < {p['min_v']}")
         if p["no_flags"] and r["n_flags"] > 0:
             why.append("rizikové vlajky")
+        if not np.isfinite(r["mos"]) or r["mos"] < p.get("min_mos", 0.0):
+            why.append(f"marža bezpečnosti < {p.get('min_mos', 0.0):.0f} %")
+        if not np.isfinite(r["fcfy"]) or r["fcfy"] < p.get("min_fcfy", 0.0):
+            why.append(f"FCF yield < {p.get('min_fcfy', 0.0):.1f} %")
         out_why.append(", ".join(why))
     df["Prečo nie"] = out_why
     df["Kandidát"] = df["Prečo nie"] == ""
@@ -266,7 +270,7 @@ with st.expander("📋 Stratégia krok za krokom", expanded=False):
 **2. Kvalita (skóre 0–100):** ROE, prevádzková a čistá marža, dlh/EBITDA, FCF marža, rast tržieb a ziskov.
 **3. Ocenenie (skóre 0–100):** FCF yield, forward P/E a EV/EBITDA voči sektorovému mediánu, rýchly DCF (marža bezpečnosti).
 **4. Rizikové vlajky:** klesajúce zisky či tržby, vysoký dlh, záporné FCF, payout nad 100 %, pokles nad 40 % od maxima.
-**5. Kandidát:** kvalita aj ocenenie nad prahom a bez vlajok. Zoznam je len začiatok.
+**5. Kandidát:** kvalita aj ocenenie nad prahom, bez vlajok, s kladnou maržou bezpečnosti rýchleho DCF a FCF yieldom aspoň 5 %. Zoznam je len začiatok.
 **6. Hĺbková kontrola (ručne):** hlavná aplikácia, 5–10-ročný priemer FCF a P/E, DCF + DDM, bear/base/bull, krížová kontrola.
 **7. Dôvod, prečo je lacná:** napíš jednou vetou. Ak ju nevieš, nekupuj.
 **8. Nákup po častiach:** 3 tranže, limit na sektor a na jednu pozíciu, v hlavnej aplikácii sleduj pásma BUY / HOLD / SELL.
@@ -280,6 +284,10 @@ with st.sidebar:
     excl_fin = st.checkbox("Vylúčiť finančný sektor a REIT", value=True, key="s_fin",
                            help="Banky, poisťovne a REIT sa oceňujú inak (BVPS, dividendy), FCF a dlh/EBITDA tu zavádzajú.")
     no_flags = st.checkbox("Vylúčiť firmy s rizikovými vlajkami", value=True, key="s_flags")
+    min_mos = st.number_input("Min. marža bezpečnosti rýchleho DCF (%)", min_value=-100.0, max_value=100.0,
+                              value=0.0, step=5.0, key="s_mos",
+                              help="Firma musí byť podľa rýchleho DCF aspoň o toľko pod férovou cenou. 0 = len nie je drahá.")
+    min_fcfy = st.number_input("Min. FCF yield (%)", min_value=0.0, max_value=20.0, value=5.0, step=0.5, key="s_fcfy")
     st.divider()
     st.markdown("**Rýchly DCF (len na prvé sito)**")
     g = st.number_input("Rast FCF, roky 1–5 (%)", min_value=-5.0, max_value=15.0, value=4.0, step=0.5, key="s_g")
@@ -289,6 +297,7 @@ with st.sidebar:
     fade = st.checkbox("Spomalenie rastu v rokoch 6–10", value=True, key="s_fade")
 
 params = dict(min_mcap=min_mcap, min_q=min_q, min_v=min_v, excl_fin=excl_fin, no_flags=no_flags,
+              min_mos=min_mos, min_fcfy=min_fcfy,
               g=g, gt=min(gt, 2.5), r=r_disc, fade=fade)
 
 universe_text = st.text_area("Zoznam tickerov na skenovanie (čiarkou; môžeš upraviť alebo pridať vlastné)",
@@ -351,6 +360,9 @@ FCF marža ≥ 10 % (15), rast tržieb ≥ 3 % (10), nezáporný rast zisku (5).
 
 **Ocenenie (max 100):** FCF yield ≥ 6 % (30), forward P/E lacnejšie o 20 % než sektorový medián (25),
 EV/EBITDA lacnejšie o 20 % než sektorový medián (20), rýchly DCF s maržou bezpečnosti ≥ 30 % (25).
+
+**Dodatočné filtre kandidáta:** marža bezpečnosti rýchleho DCF aspoň 0 % a FCF yield aspoň 5 % (nastaviteľné). Bránia tomu,
+aby firma prešla len vďaka tomu, že je lacnejšia než sektorový medián, hoci podľa DCF drahá je.
 
 **Čo to nevie:** sektorové mediány sú len v rámci skenovaného zoznamu; ROE môžu nafúknuť spätné odkupy a dlh;
 rast ziskov z Yahoo je za posledný kvartál a je zašumený; rýchly DCF používa jednotný rast a FCF z Yahoo (TTM), počet akcií berie z trhovej kapitalizácie;

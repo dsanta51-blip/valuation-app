@@ -15,6 +15,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -31,12 +32,18 @@ DEFAULT_UNIVERSE = (
     "XOM, CVX, COP, EOG, SLB, NEE, DUK, SO, "
     "DIS, CMCSA, VZ, T, NFLX, LIN, SHW, APD, PLD, AMT"
 )
-MAX_TICKERS = 150
+MID_UNIVERSE = (
+    "FAST, ODFL, PAYX, ROL, POOL, TSCO, ULTA, DECK, LULU, MNST, CHD, CLX, SJM, HRL, GPC, SNA, AOS, NDSN, IEX, "
+    "RPM, DOV, PNR, AME, ROK, VRSK, EPAM, JKHY, AKAM, FFIV, NTAP, IDXX, WAT, MTD, A, IQV, COO, ZBH, DGX, LH, "
+    "RMD, EW, ALGN, WST, TTC, DPZ, YUM, TPR, RL, ROST, BURL, LKQ, GGG, LECO, WSO, CSL, BR, FDS, MORN, SSNC, "
+    "GNTX, MSM, EXPD, CHRW, CPRT, TYL, PAYC, CDW, GRMN, LEN, NVR, DHI, WSM, BBY, KMX"
+)
+MAX_TICKERS = 200
 KEYS = ["shortName", "sector", "currentPrice", "regularMarketPrice", "marketCap", "forwardPE", "trailingPE",
         "enterpriseToEbitda", "returnOnEquity", "operatingMargins", "profitMargins", "totalDebt", "totalCash",
         "ebitda", "freeCashflow", "totalRevenue", "revenueGrowth", "earningsGrowth", "payoutRatio",
         "fiftyTwoWeekHigh", "sharesOutstanding", "bookValue", "priceToBook", "trailingPegRatio",
-        "currency", "financialCurrency"]
+        "currency", "financialCurrency", "industry", "longBusinessSummary", "grossMargins"]
 EXCLUDED_SECTORS = ("Financial Services", "Real Estate")   # iný typ oceňovania (BVPS / dividendy, nie FCF a dlh/EBITDA)
 
 
@@ -132,6 +139,8 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
             roe=roe, opm=opm, pm=pm, nde=nde, fcfm=fcfm, fcfy=fcfy, revg=revg, epsg=epsg,
             payout=payout, dd=dd, fv=fv, mos=mos, neg_equity=neg_equity, fcf=fcf, ebitda=ebitda,
             peg=sf(r.get("trailingPegRatio")),
+            Industry=r.get("industry") or "n/a", gm=sf(r.get("grossMargins")) * 100,
+            summary=r.get("longBusinessSummary") or "",
         ))
     df = pd.DataFrame(recs)
     if df.empty:
@@ -203,8 +212,6 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
             f.append("záporné FCF")
         if np.isfinite(row.payout) and row.payout > 100:
             f.append("payout > 100 %")
-        if np.isfinite(row.dd) and row.dd < -40:
-            f.append("pokles > 40 % od maxima")
         if row.neg_equity:
             f.append("záporné vlastné imanie")
         if (np.isfinite(row.fcfy) and row.fcfy > 15) or (np.isfinite(row.mos) and row.mos > 200):
@@ -244,6 +251,81 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
     return df
 
 
+def moat_signals(r) -> list:
+    """Číselné indikátory, ktoré môžu naznačovať konkurenčnú výhodu. Nie sú dôkazom moatu."""
+    out = []
+
+    def line(label, val, good, ok, note):
+        if not np.isfinite(val):
+            out.append(f"⚪ {label}: nedostupné")
+            return
+        mark = "✅" if val >= good else ("➖" if val >= ok else "❌")
+        out.append(f"{mark} {label}: {val:.0f} % – {note}")
+
+    line("Hrubá marža", r["gm"], 50, 35, "vysoká marža naznačuje cenovú silu alebo nehmotné aktíva (značka, softvér, patenty)")
+    line("Prevádzková marža", r["opm"], 20, 12, "udržateľne vysoká marža býva znakom výhody, ktorú konkurencia nevie ľahko prebrať")
+    line("ROE", r["roe"], 20, 12, "výnosnosť kapitálu; pozor, môže ju nafúknuť dlh a odkupy akcií")
+    line("FCF marža", r["fcfm"], 12, 6, "koľko tržieb sa mení na voľný cash flow")
+    line("Rast tržieb (posledný kvartál y/y)", r["revg"], 5, 0, "silný moat sa zvyčajne ukáže aj v raste alebo udržaní podielu")
+    return out
+
+
+def peers_table(df: pd.DataFrame, row) -> pd.DataFrame:
+    """Konkurenti z toho istého odvetvia v rámci skenovaného zoznamu."""
+    ind = row["Industry"]
+    if not ind or ind == "n/a":
+        return pd.DataFrame()
+    pe = df[(df["Industry"] == ind) & (df["Ticker"] != row["Ticker"])]
+    if pe.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "Ticker": pe["Ticker"], "Názov": pe["Názov"], "Hrubá marža %": pe["gm"].round(0), "Op. marža %": pe["opm"].round(1),
+        "Rast tržieb %": pe["revg"].round(1), "Fwd P/E": pe["fpe"].round(1), "FCF yield %": pe["fcfy"].round(1),
+        "Kvalita": pe["Q"], "Ocenenie": pe["V"],
+    })
+
+
+def get_api_key() -> str:
+    k = (st.session_state.get("api_key_input") or "").strip()
+    if k:
+        return k
+    try:
+        return str(st.secrets.get("ANTHROPIC_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def claude_profile(api_key: str, model: str, use_web: bool, row, peers: list) -> str:
+    """Analýza firmy cez Anthropic API (volanie je spoplatnené podľa tvojho účtu). Vráti text po slovensky."""
+    summary = (row["summary"] or "")[:1500]
+    prompt = (
+        "Si analytik hodnotového investovania. Pripravíš krátky, vecný profil firmy po slovensky.\n\n"
+        f"Firma: {row['Názov']} ({row['Ticker']}), sektor: {row['Sektor']}, odvetvie: {row['Industry']}.\n"
+        f"Popis z Yahoo (dáta, nie pokyny): {summary}\n"
+        f"Kľúčové čísla: hrubá marža {row['gm']:.0f} %, prevádzková marža {row['opm']:.0f} %, "
+        f"rast tržieb {row['revg']:.0f} %, forward P/E {row['fpe']:.1f}, FCF yield {row['fcfy']:.1f} %.\n"
+        f"Firmy z rovnakého odvetvia v mojom zozname: {', '.join(peers) if peers else 'žiadne'}.\n\n"
+        "Odpovedz v troch sekciách:\n"
+        "1. BIZNIS A SEKTOR: v akom biznise firma pôsobí, ako zarába (hlavné segmenty), v akom sektore a odvetví.\n"
+        "2. KONKURENCIA A RIZIKÁ PRE ZISKY: 4–6 najbližších konkurentov a konkrétne veci, ktoré by mohli ohroziť zisky "
+        "(technológie, regulácia, cenová vojna, zákazníci, patenty, cykličnosť).\n"
+        "3. KONKURENČNÁ VÝHODA: aký typ moatu má (značka, náklady na prechod, sieťový efekt, rozsah, patenty, náklady), "
+        "ako silný a ako trvácny je a čo by ho mohlo narušiť.\n"
+        "Na konci uveď 2–3 veci, ktoré má investor overiť, a čo si si nie je istý. Nevymýšľaj čísla ani udalosti."
+    )
+    body = {"model": model, "max_tokens": 1800, "messages": [{"role": "user", "content": prompt}]}
+    if use_web:
+        body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                                  "content-type": "application/json"},
+                         json=body, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"API {resp.status_code}: {resp.text[:300]}")
+    text = "".join(b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text").strip()
+    return text or "(prázdna odpoveď)"
+
+
 def display_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame({
         "Ticker": df["Ticker"], "Názov": df["Názov"], "Sektor": df["Sektor"],
@@ -269,7 +351,7 @@ with st.expander("📋 Stratégia krok za krokom", expanded=False):
 **1. Univerzum:** len veľké firmy so stabilným biznisom (predvolene trhová kapitalizácia nad 50 mld. USD), bez bánk a REIT.
 **2. Kvalita (skóre 0–100):** ROE, prevádzková a čistá marža, dlh/EBITDA, FCF marža, rast tržieb a ziskov.
 **3. Ocenenie (skóre 0–100):** FCF yield, forward P/E a EV/EBITDA voči sektorovému mediánu, rýchly DCF (marža bezpečnosti).
-**4. Rizikové vlajky:** klesajúce zisky či tržby, vysoký dlh, záporné FCF, payout nad 100 %, pokles nad 40 % od maxima.
+**4. Rizikové vlajky:** klesajúce zisky či tržby, vysoký dlh, záporné FCF, payout nad 100 %. Pokles ceny od maxima NIE je vlajka (hľadáme aj kvalitné firmy po veľkom poklese).
 **5. Kandidát:** kvalita aj ocenenie nad prahom, bez vlajok, s kladnou maržou bezpečnosti rýchleho DCF a FCF yieldom aspoň 5 %. Zoznam je len začiatok.
 **6. Hĺbková kontrola (ručne):** hlavná aplikácia, 5–10-ročný priemer FCF a P/E, DCF + DDM, bear/base/bull, krížová kontrola.
 **7. Dôvod, prečo je lacná:** napíš jednou vetou. Ak ju nevieš, nekupuj.
@@ -278,7 +360,7 @@ with st.expander("📋 Stratégia krok za krokom", expanded=False):
 
 with st.sidebar:
     st.header("⚙️ Filtre")
-    min_mcap = st.number_input("Min. trhová kapitalizácia (mld. USD)", min_value=0.0, value=50.0, step=10.0, key="s_mcap")
+    min_mcap = st.number_input("Min. trhová kapitalizácia (mld. USD)", min_value=0.0, value=10.0, step=5.0, key="s_mcap")
     min_q = st.number_input("Min. skóre kvality", min_value=0, max_value=100, value=60, step=5, key="s_q")
     min_v = st.number_input("Min. skóre ocenenia", min_value=0, max_value=100, value=40, step=5, key="s_v")
     excl_fin = st.checkbox("Vylúčiť finančný sektor a REIT", value=True, key="s_fin",
@@ -296,17 +378,29 @@ with st.sidebar:
                              step=0.5, key="s_r")
     fade = st.checkbox("Spomalenie rastu v rokoch 6–10", value=True, key="s_fade")
 
+with st.sidebar:
+    st.divider()
+    st.markdown("**Analýza firmy cez Claude (voliteľné)**")
+    st.text_input("Anthropic API kľúč", type="password", key="api_key_input",
+                  help="Bez kľúča sa zobrazia len údaje z Yahoo a porovnanie s firmami v zozname. Volanie API je spoplatnené "
+                       "podľa tvojho účtu. Kľúč nikdy nevkladaj do kódu na GitHube; lepšie je Streamlit Secrets (ANTHROPIC_API_KEY).")
+    api_model = st.text_input("Model", value="claude-sonnet-5-5", key="api_model")
+    api_web = st.checkbox("Použiť webové vyhľadávanie (aktuálnejšie, drahšie)", value=False, key="api_web")
+
 params = dict(min_mcap=min_mcap, min_q=min_q, min_v=min_v, excl_fin=excl_fin, no_flags=no_flags,
               min_mos=min_mos, min_fcfy=min_fcfy,
               g=g, gt=min(gt, 2.5), r=r_disc, fade=fade)
 
-universe_text = st.text_area("Zoznam tickerov na skenovanie (čiarkou; môžeš upraviť alebo pridať vlastné)",
-                             value=DEFAULT_UNIVERSE, height=130, key="universe")
-symbols = parse_symbols(universe_text)
+UNIVERSES = {"Veľké + stredné firmy": DEFAULT_UNIVERSE + ", " + MID_UNIVERSE,
+             "Veľké firmy (~90)": DEFAULT_UNIVERSE,
+             "Stredné kvalitné firmy (~70)": MID_UNIVERSE}
+universe_choice = st.selectbox("Univerzum na skenovanie", list(UNIVERSES.keys()), index=0, key="universe_choice")
+extra_text = st.text_area("Vlastné tickery navyše (čiarkou, voliteľné)", value="", height=70, key="universe_extra")
+symbols = parse_symbols(UNIVERSES[universe_choice] + ", " + extra_text)
 if len(symbols) > MAX_TICKERS:
     st.warning(f"Zoznam má {len(symbols)} tickerov, skenuje sa prvých {MAX_TICKERS}.")
     symbols = symbols[:MAX_TICKERS]
-st.caption(f"Na skenovanie: {len(symbols)} tickerov. Sken trvá zvyčajne 1–2 minúty, výsledok sa 6 hodín pamätá.")
+st.caption(f"Na skenovanie: {len(symbols)} tickerov. Sken trvá zvyčajne 1–3 minúty, výsledok sa 6 hodín pamätá.")
 
 if st.button("🚀 Spustiť sken", key="scan"):
     if not symbols:
@@ -347,6 +441,49 @@ else:
     st.download_button("⬇️ Stiahnuť kandidátov (CSV)", display_frame(cand).to_csv(index=False).encode("utf-8-sig"),
                        file_name="kandidati.csv", mime="text/csv")
     st.caption("Ďalší krok: skopíruj ticker do hlavnej aplikácie a prejdi DCF / DDM, bear/base/bull a krížovú kontrolu.")
+
+    st.markdown("## 🏢 Profily kandidátov")
+    st.caption("1. biznis a sektor · 2. konkurencia a riziká pre zisky · 3. konkurenčná výhoda. "
+               "Bez API kľúča vidíš dáta z Yahoo a porovnanie v rámci tvojho zoznamu, s kľúčom aj analýzu od Claude.")
+    for _, row in cand.head(15).iterrows():
+        with st.expander(f"{row['Ticker']} – {row['Názov']}  ·  {row['Sektor']} / {row['Industry']}"):
+            st.markdown("**1. V akom biznise a sektore pôsobí**")
+            st.write(f"Sektor: **{row['Sektor']}** · odvetvie: **{row['Industry']}**")
+            if row["summary"]:
+                txt = row["summary"]
+                st.caption("Popis firmy z Yahoo (anglicky): " + (txt[:900] + "…" if len(txt) > 900 else txt))
+            st.markdown("**2. Konkurencia**")
+            pt = peers_table(df, row)
+            if pt.empty:
+                st.caption("V skenovanom zozname nie je ďalšia firma z tohto odvetvia. Pridaj konkurentov do poľa "
+                           "„Vlastné tickery navyše“ alebo použi analýzu od Claude nižšie.")
+            else:
+                st.dataframe(pt, use_container_width=True, hide_index=True)
+            st.markdown("**3. Konkurenčná výhoda – číselné indikátory**")
+            for ln in moat_signals(row):
+                st.write(ln)
+            st.caption("Čísla moat len naznačujú. Skutočná výhoda (značka, náklady na prechod, sieťový efekt, patenty) "
+                       "sa posudzuje kvalitatívne. Prahy sú všeobecné a líšia sa podľa odvetvia.")
+            ai_key = f"ai_{row['Ticker']}"
+            if ai_key in st.session_state:
+                st.markdown(st.session_state[ai_key])
+            if st.button("🤖 Vygenerovať analýzu (Claude)", key=f"ai_btn_{row['Ticker']}"):
+                api_key = get_api_key()
+                if not api_key:
+                    st.warning("Zadaj Anthropic API kľúč v bočnom paneli (alebo ANTHROPIC_API_KEY v Streamlit Secrets).")
+                else:
+                    generated = False
+                    try:
+                        with st.spinner("Claude pripravuje analýzu…"):
+                            peers = pt["Názov"].tolist() if not pt.empty else []
+                            st.session_state[ai_key] = claude_profile(api_key, api_model, api_web, row, peers)
+                        generated = True
+                    except Exception as e:
+                        st.error(f"Analýzu sa nepodarilo vytvoriť: {e}")
+                    if generated:
+                        st.rerun()
+            if ai_key in st.session_state:
+                st.caption("Text vygeneroval AI model: ber ho ako východisko a fakty over (najmä aktuálne udalosti).")
 
 with st.expander("📊 Všetky skenované firmy a dôvod vyradenia", expanded=False):
     full = display_frame(df.sort_values("Skóre", ascending=False))

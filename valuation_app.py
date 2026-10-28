@@ -1133,10 +1133,68 @@ def build_cross_check(d: dict, price: float):
 
 
 # ----------------------------------------------------------------------------
+# GRAF CENY A PRIEMERNEJ CENY
+# ----------------------------------------------------------------------------
+CHART_PERIODS = {"1 rok": 365, "3 roky": 365 * 3, "5 rokov": 365 * 5, "Max (7 rokov)": None}
+
+
+def render_price_chart(tk: str, raw: dict, price: float, fair: float = None):
+    """Graf zatváracej ceny s priemernou cenou za zvolené obdobie, voliteľne 200-dňovým priemerom,
+    férovou cenou z modelu a vlastnou priemernou nákupnou cenou."""
+    st.markdown("## 📈 Cena a priemerná cena")
+    hist = raw.get("hist")
+    if hist is None or hist.empty or "Close" not in hist:
+        st.info("História cien nie je dostupná.")
+        return
+    close = hist["Close"].dropna()
+    if close.empty:
+        st.info("História cien nie je dostupná.")
+        return
+    c1, c2, c3 = st.columns(3)
+    period = c1.selectbox("Obdobie", list(CHART_PERIODS.keys()), index=1, key=f"{tk}_chart_period")
+    show_ma = c2.checkbox("200-dňový priemer", value=True, key=f"{tk}_chart_ma")
+    show_fv = c3.checkbox("Férová cena a nákupná hranica z modelu", value=True, key=f"{tk}_chart_fv",
+                          disabled=fair is None)
+    my_avg = num(st.columns(3)[0], "Moja priemerná nákupná cena (voliteľné, 0 = nepoužiť)", 0.0,
+                 f"{tk}_my_avg", min_value=0.0, step=1.0)
+
+    days = CHART_PERIODS[period]
+    sub = close if days is None else close[close.index >= close.index[-1] - pd.Timedelta(days=days)]
+    if sub.empty:
+        st.info("V zvolenom období nie sú dáta.")
+        return
+    avg = float(sub.mean())
+    df = pd.DataFrame({"Cena": sub})
+    df["Priemerná cena (obdobie)"] = avg
+    if show_ma:
+        ma = close.rolling(200).mean().reindex(sub.index)
+        if ma.notna().any():
+            df["200-dňový priemer"] = ma
+    if show_fv and fair is not None and np.isfinite(fair) and fair > 0:
+        df["Férová cena (model)"] = fair
+        df["Nákupná hranica (FV × 0.85)"] = fair * BUY_LEVEL
+    if my_avg > 0:
+        df["Moja priemerná cena"] = my_avg
+    st.line_chart(df)
+
+    hi, lo = max(float(sub.max()), price), min(float(sub.min()), price)
+    cols = st.columns(5 if my_avg > 0 else 4)
+    cols[0].metric("Priemerná cena (obdobie)", f"{avg:,.2f}")
+    cols[1].metric("Cena vs. priemer", f"{(price / avg - 1) * 100:+.1f} %")
+    cols[2].metric("Minimum / maximum", f"{lo:,.2f} / {hi:,.2f}")
+    cols[3].metric("Od maxima obdobia", f"{(price / hi - 1) * 100:+.1f} %")
+    if my_avg > 0:
+        cols[4].metric("Moja pozícia", f"{(price / my_avg - 1) * 100:+.1f} %")
+    st.caption("Priemerná cena = jednoduchý priemer zatváracích cien za zvolené obdobie (nie vážený objemom). "
+               "Cena pod dlhodobým priemerom je len kontext, nie dôkaz podhodnotenia. "
+               "Vlastná priemerná cena a markery nákupov z brokera sa dajú zadať len ako jedna hodnota.")
+
+
+# ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
 st.title("📊 Valuačná kalkulačka – Graham & Buffett")
-st.caption("Margin of Safety ±15 % · Diluted shares · FCF = Operating Cash Flow − CapEx · Verzia kódu: V2 (stabilná, bez EDGAR a Finviz)")
+st.caption("Margin of Safety ±15 % · Diluted shares · FCF = Operating Cash Flow − CapEx · Verzia kódu: V2.1 (stabilná + graf ceny)")
 
 with st.sidebar:
     st.header("⚙️ Nastavenia")
@@ -1222,12 +1280,16 @@ st.divider()
 render_discount_helper(tk, d, model, price)
 result = RUNNERS[model](tk, d, price)
 if result is None:
+    st.divider()
+    render_price_chart(tk, raw, price)
     st.stop()
 
 fair = result["fair"]
 if not np.isfinite(fair) or fair <= 0:
     st.error("Model vyšiel so zápornou / neplatnou férovou cenou – model nie je pre túto firmu relevantný "
              "alebo sú vstupy chybné. Skús iný model alebo uprav vstupy.")
+    st.divider()
+    render_price_chart(tk, raw, price)
     st.stop()
 
 for w in result["warnings"]:
@@ -1259,6 +1321,9 @@ ladder = pd.DataFrame([
 ], columns=["Zóna", "Podmienka", "Cenové pásmo", "k"])
 ladder["Aktuálne"] = np.where(ladder["k"] == z["key"], "◀ TU SME", "")
 st.table(ladder.drop(columns="k").set_index("Zóna"))
+
+st.divider()
+render_price_chart(tk, raw, price, fair)
 
 # --- Bear / Base / Bull a robustnosť zóny
 lo_hi = result.get("range")

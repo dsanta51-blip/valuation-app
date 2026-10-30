@@ -38,12 +38,17 @@ MID_UNIVERSE = (
     "RMD, EW, ALGN, WST, TTC, DPZ, YUM, TPR, RL, ROST, BURL, LKQ, GGG, LECO, WSO, CSL, BR, FDS, MORN, SSNC, "
     "GNTX, MSM, EXPD, CHRW, CPRT, TYL, PAYC, CDW, GRMN, LEN, NVR, DHI, WSM, BBY, KMX"
 )
-MAX_TICKERS = 200
+SMALL_UNIVERSE = (
+    "BMI, EXPO, FELE, ESE, KAI, MLI, CSWI, BRC, UFPT, ICFI, WDFC, LANC, JJSF, CALM, TR, IPAR, BOOT, YETI, SHOO, DORM, "
+    "QLYS, CRVL, LMAT, UTMD, SMPL, USLM, MGRC, NSP, AIT, SSD, AAON, SXI, TNC, FSS, HWKN, BCPC, SXT, NEU, KWR, IOSP, "
+    "ALRM, AGYS, PRGS, PLUS, EPAC, HURN, FCN, EXLS, NSIT, DLB, COKE, FIZZ, SAM, NPK, OSIS, USPH, MMSI, ITGR, SUPN, HSTM"
+)
+MAX_TICKERS = 260
 KEYS = ["shortName", "sector", "currentPrice", "regularMarketPrice", "marketCap", "forwardPE", "trailingPE",
         "enterpriseToEbitda", "returnOnEquity", "operatingMargins", "profitMargins", "totalDebt", "totalCash",
         "ebitda", "freeCashflow", "totalRevenue", "revenueGrowth", "earningsGrowth", "payoutRatio",
         "fiftyTwoWeekHigh", "sharesOutstanding", "bookValue", "priceToBook", "trailingPegRatio",
-        "currency", "financialCurrency", "industry", "longBusinessSummary", "grossMargins"]
+        "currency", "financialCurrency", "industry", "longBusinessSummary", "grossMargins", "averageVolume"]
 EXCLUDED_SECTORS = ("Financial Services", "Real Estate")   # iný typ oceňovania (BVPS / dividendy, nie FCF a dlh/EBITDA)
 
 
@@ -141,6 +146,7 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
             peg=sf(r.get("trailingPegRatio")),
             Industry=r.get("industry") or "n/a", gm=sf(r.get("grossMargins")) * 100,
             summary=r.get("longBusinessSummary") or "",
+            turnover=(sf(r.get("averageVolume")) * price / 1e6) if np.isfinite(price) else np.nan,
         ))
     df = pd.DataFrame(recs)
     if df.empty:
@@ -245,6 +251,8 @@ def analyze(rows: list, p: dict) -> pd.DataFrame:
             why.append(f"marža bezpečnosti < {p.get('min_mos', 0.0):.0f} %")
         if not np.isfinite(r["fcfy"]) or r["fcfy"] < p.get("min_fcfy", 0.0):
             why.append(f"FCF yield < {p.get('min_fcfy', 0.0):.1f} %")
+        if np.isfinite(r["turnover"]) and r["turnover"] < p.get("min_turnover", 0.0):
+            why.append(f"nízka likvidita (obrat < {p.get('min_turnover', 0.0):.1f} mil.)")
         out_why.append(", ".join(why))
     df["Prečo nie"] = out_why
     df["Kandidát"] = df["Prečo nie"] == ""
@@ -334,7 +342,7 @@ def display_frame(df: pd.DataFrame) -> pd.DataFrame:
         "Rýchly DCF": df["fv"].round(2), "MoS %": df["mos"].round(0),
         "FCF yield %": df["fcfy"].round(1), "Fwd P/E": df["fpe"].round(1), "EV/EBITDA": df["ev_ebitda"].round(1),
         "ROE %": df["roe"].round(0), "Op. marža %": df["opm"].round(1), "ND/EBITDA": df["nde"].round(1),
-        "Od maxima %": df["dd"].round(0), "Vlajky": df["Vlajky"], "Dáta %": df["Úplnosť dát %"].round(0),
+        "Od maxima %": df["dd"].round(0), "Vlajky": df["Vlajky"], "Obrat mil.": df["turnover"].round(1), "Dáta %": df["Úplnosť dát %"].round(0),
     })
     return out
 
@@ -370,6 +378,9 @@ with st.sidebar:
                               value=0.0, step=5.0, key="s_mos",
                               help="Firma musí byť podľa rýchleho DCF aspoň o toľko pod férovou cenou. 0 = len nie je drahá.")
     min_fcfy = st.number_input("Min. FCF yield (%)", min_value=0.0, max_value=20.0, value=5.0, step=0.5, key="s_fcfy")
+    min_turnover = st.number_input("Min. denný obrat (mil. USD)", min_value=0.0, max_value=100.0, value=1.0, step=0.5,
+                                   key="s_turn", help="Ochrana pri malých firmách: priemerný objem × cena. Pod limitom sa "
+                                                      "firma vyradí, lebo sa zle obchoduje. Neznámy obrat firmu nevyradí.")
     st.divider()
     st.markdown("**Rýchly DCF (len na prvé sito)**")
     g = st.number_input("Rast FCF, roky 1–5 (%)", min_value=-5.0, max_value=15.0, value=4.0, step=0.5, key="s_g")
@@ -388,13 +399,29 @@ with st.sidebar:
     api_web = st.checkbox("Použiť webové vyhľadávanie (aktuálnejšie, drahšie)", value=False, key="api_web")
 
 params = dict(min_mcap=min_mcap, min_q=min_q, min_v=min_v, excl_fin=excl_fin, no_flags=no_flags,
-              min_mos=min_mos, min_fcfy=min_fcfy,
+              min_mos=min_mos, min_fcfy=min_fcfy, min_turnover=min_turnover,
               g=g, gt=min(gt, 2.5), r=r_disc, fade=fade)
 
 UNIVERSES = {"Veľké + stredné firmy": DEFAULT_UNIVERSE + ", " + MID_UNIVERSE,
              "Veľké firmy (~90)": DEFAULT_UNIVERSE,
-             "Stredné kvalitné firmy (~70)": MID_UNIVERSE}
-universe_choice = st.selectbox("Univerzum na skenovanie", list(UNIVERSES.keys()), index=0, key="universe_choice")
+             "Stredné kvalitné firmy (~70)": MID_UNIVERSE,
+             "Malé firmy – small caps (~60)": SMALL_UNIVERSE,
+             "Všetko: veľké + stredné + malé": DEFAULT_UNIVERSE + ", " + MID_UNIVERSE + ", " + SMALL_UNIVERSE}
+MCAP_BY_UNIVERSE = {"Veľké + stredné firmy": 10.0, "Veľké firmy (~90)": 10.0, "Stredné kvalitné firmy (~70)": 10.0,
+                    "Malé firmy – small caps (~60)": 0.3, "Všetko: veľké + stredné + malé": 0.3}
+
+
+def _on_universe_change():
+    """Pri zmene univerza nastaví rozumnú min. kapitalizáciu (môžeš ju potom ručne upraviť)."""
+    st.session_state["s_mcap"] = MCAP_BY_UNIVERSE.get(st.session_state.get("universe_choice"), 10.0)
+
+
+universe_choice = st.selectbox("Univerzum na skenovanie", list(UNIVERSES.keys()), index=0, key="universe_choice",
+                               on_change=_on_universe_change)
+if "Malé" in universe_choice or "Všetko" in universe_choice:
+    st.info("Small caps sú rizikovejšie: nižšia likvidita, väčšie výkyvy a menej analytikov (forward P/E často chýba, "
+            "firma potom vypadne pre neúplné dáta). Min. kapitalizácia sa nastavila na 0,3 mld.; filter obratu v bočnom "
+            "paneli chráni pred ťažko obchodovateľnými firmami. Sken väčšieho zoznamu trvá dlhšie (3–5 minút).")
 extra_text = st.text_area("Vlastné tickery navyše (čiarkou, voliteľné)", value="", height=70, key="universe_extra")
 symbols = parse_symbols(UNIVERSES[universe_choice] + ", " + extra_text)
 if len(symbols) > MAX_TICKERS:

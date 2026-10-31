@@ -41,6 +41,7 @@ svg.h .seg:not(.on){opacity:.25}
 #tip{position:absolute;pointer-events:none;background:var(--text);color:var(--bg);padding:8px 10px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .1s;white-space:nowrap;z-index:5}
 .lg div{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
 .lg i{width:10px;height:10px;border-radius:50%}.lg span{margin-left:auto;color:var(--mut)}
+.ic{background:none;border:1px solid var(--line);color:var(--mut);border-radius:6px;padding:2px 8px;margin-left:4px;cursor:pointer;font:inherit}.ic.x{color:var(--neg);border-color:var(--neg)}
 .tw{overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:900px}
 th,td{padding:10px 8px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -59,7 +60,7 @@ input{background:var(--bg);color:var(--text);border:1px solid var(--line);border
 </style>
 </head>
 <body>
-<header><h1>📈 Portfólio akcií</h1><div><button class="btn g" id="clr">Vymazať ukážkové dáta</button> <button class="btn" id="add">+ Pridať akciu</button></div></header>
+<header><h1>📈 Portfólio akcií</h1><div><button class="btn" id="add">+ Pridať akciu</button></div></header>
 <main>
 <section class="kpis">
 <div class="card kpi"><small>Celková hodnota portfólia</small><b id="k1">–</b><small id="k1s"></small></div>
@@ -68,10 +69,10 @@ input{background:var(--bg);color:var(--text);border:1px solid var(--line);border
 </section>
 <section class="card"><h2>Rozloženie investovaného kapitálu: vnútorný kruh sektory, vonkajší akcie</h2>
 <div class="donut"><div class="dw"><svg id="ch" viewBox="0 0 400 400" role="img" aria-label="Dvojvrstvový kruhový graf portfólia"></svg><div id="tip"></div></div><div class="lg" id="lg"></div></div></section>
-<section class="card"><h2>Pozície</h2><div class="tw"><table><thead><tr><th>Ticker</th><th>Firma a sektor</th><th>Aktuálna cena</th><th>Férová cena</th><th>Priemer 5 rokov</th><th>Nákupná cena</th><th>Predajná cena</th><th>Zisk / strata</th><th>Yield on Cost</th></tr></thead><tbody id="tb"></tbody></table></div>
-<p style="color:var(--mut);font-size:12px;margin:12px 0 0">Ceny zadávaš ručne a ukladajú sa len v tomto prehliadači. Ukážkové čísla nie sú živé kotácie.</p></section>
+<section class="card"><h2>Pozície</h2><div class="tw"><table><thead><tr><th>Ticker</th><th>Firma a sektor</th><th>Aktuálna cena</th><th>Férová cena</th><th>Priemer 5 rokov</th><th>Nákupná cena</th><th>Predajná cena</th><th>Zisk / strata</th><th>Yield on Cost</th><th></th></tr></thead><tbody id="tb"></tbody></table></div>
+<p style="color:var(--mut);font-size:12px;margin:12px 0 0">Ceny zadávaš ručne a ukladajú sa len v tomto prehliadači.</p></section>
 </main>
-<dialog id="dlg"><form id="f" method="dialog"><h2 class="w" style="grid-column:1/-1">Nová akcia</h2>
+<dialog id="dlg"><form id="f" method="dialog"><h2 id="ttl" style="grid-column:1/-1">Nová akcia</h2>
 <label>Ticker<input name="t" required maxlength="12"></label><label>Názov firmy<input name="n"></label>
 <label class="w">Sektor<input name="s" list="sl" required><datalist id="sl"><option value="Technológie"><option value="Zdravotníctvo"><option value="Spotrebný tovar"><option value="Financie"><option value="Energetika"><option value="Priemysel"></datalist></label>
 <label>Počet kusov<input name="q" type="number" step="any" min="0" required></label><label>Nákupná cena ($)<input name="b" type="number" step="any" min="0" required></label>
@@ -83,27 +84,19 @@ input{background:var(--bg);color:var(--text);border:1px solid var(--line);border
 const NB='\u00A0',nf=new Intl.NumberFormat('sk-SK',{minimumFractionDigits:2,maximumFractionDigits:2});
 const $=s=>document.querySelector(s),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=v=>Number.isFinite(v)?nf.format(v)+NB+'$':'–',pct=(v,s)=>Number.isFinite(v)?(s&&v>0?'+':'')+nf.format(v)+NB+'%':'–';
-const DEMO=[
-{t:'AAPL',n:'Apple Inc.',s:'Technológie',q:20,b:150,c:225,f:210,a:165,x:null,d:1},
-{t:'MSFT',n:'Microsoft Corp.',s:'Technológie',q:10,b:300,c:420,f:400,a:330,x:null,d:3.3},
-{t:'GOOGL',n:'Alphabet Inc.',s:'Technológie',q:12,b:120,c:170,f:185,a:135,x:null,d:.8},
-{t:'JNJ',n:'Johnson & Johnson',s:'Zdravotníctvo',q:25,b:150,c:160,f:175,a:160,x:null,d:4.9},
-{t:'ABBV',n:'AbbVie Inc.',s:'Zdravotníctvo',q:12,b:140,c:190,f:180,a:150,x:null,d:6.4},
-{t:'PG',n:'Procter & Gamble',s:'Spotrebný tovar',q:18,b:140,c:165,f:160,a:150,x:null,d:4},
-{t:'KO',n:'Coca-Cola Co.',s:'Spotrebný tovar',q:40,b:58,c:62,f:65,a:59,x:null,d:1.9},
-{t:'NKE',n:'Nike Inc.',s:'Spotrebný tovar',q:15,b:130,c:80,f:100,a:110,x:95,d:1.5}];
-let S=null;try{S=JSON.parse(localStorage.getItem('pf1'))}catch(e){}
+const DEMO=[];
+let S=null;try{S=JSON.parse(localStorage.getItem('pf2'))}catch(e){}
 if(!Array.isArray(S))S=DEMO.slice();
-const save=()=>{try{localStorage.setItem('pf1',JSON.stringify(S))}catch(e){}};
+const save=()=>{try{localStorage.setItem('pf2',JSON.stringify(S))}catch(e){}};
 const HUE=[226,160,28,330,270,190,50,0];
 function arc(r0,r1,a0,a1){if(a1-a0>6.283)a1=a0+6.283;const P=(r,a)=>(200+r*Math.cos(a)).toFixed(2)+','+(200+r*Math.sin(a)).toFixed(2),l=a1-a0>Math.PI?1:0;
 return`M${P(r1,a0)}A${r1} ${r1} 0 ${l} 1 ${P(r1,a1)}L${P(r0,a1)}A${r0} ${r0} 0 ${l} 0 ${P(r0,a0)}Z`}
 function render(){
-const L=S.map(p=>{const sold=p.x>0,inv=p.q*p.b,val=p.q*(sold?p.x:p.c);return{...p,sold,inv,val,pl:(val/inv-1)*100,yoc:p.d>0?p.d/p.b*100:NaN}}).filter(p=>p.inv>0);
+const L=S.map((p,i)=>{const sold=p.x>0,inv=p.q*p.b,val=p.q*(sold?p.x:p.c);return{...p,i,sold,inv,val,pl:(val/inv-1)*100,yoc:p.d>0?p.d/p.b*100:NaN}}).filter(p=>p.inv>0);
 const held=L.filter(p=>!p.sold),tot=held.reduce((a,p)=>a+p.q*p.c,0),inv=L.reduce((a,p)=>a+p.inv,0),val=L.reduce((a,p)=>a+p.val,0);
 const sc=[...new Set(L.map(p=>p.s))],cls=v=>v>=0?'pos':'neg';
 $('#k1').textContent=money(tot);$('#k1s').textContent=held.length+' držaných pozícií';
-const pl=inv?(val/inv-1)*100:NaN;$('#k2').textContent=pct(pl,1);$('#k2').className=cls(pl);$('#k2s').textContent=money(val-inv)+' (vrátane predaných)';
+const pl=inv?(val/inv-1)*100:NaN;$('#k2').textContent=pct(pl,1);$('#k2').className=Number.isFinite(pl)?cls(pl):'';$('#k2s').textContent=money(val-inv)+' (vrátane predaných)';
 let best=null;sc.forEach(s=>{const g=L.filter(p=>p.s===s),i=g.reduce((a,p)=>a+p.inv,0),v=g.reduce((a,p)=>a+p.val,0),r=(v/i-1)*100;if(!best||r>best.r)best={s,r}});
 $('#k3').textContent=best?best.s:'–';$('#k3s').textContent=best?pct(best.r,1):'';
 const hi=held.reduce((a,p)=>a+p.inv,0),secs=sc.map(s=>({s,items:held.filter(p=>p.s===s).sort((a,b)=>b.inv-a.inv),h:HUE[sc.indexOf(s)%8]})).filter(g=>g.items.length);
@@ -117,17 +110,20 @@ lg+=`<div><i style="background:hsl(${g.h} 70% 45%)"></i>${esc(g.s)}<span>${money
 const ch=$('#ch');ch.innerHTML=h+`<text x="200" y="192" text-anchor="middle" fill="var(--mut)" font-size="13" id="c1">Investované</text><text x="200" y="218" text-anchor="middle" fill="var(--text)" font-size="20" font-weight="700" id="c2">${money(hi)}</text>`;
 $('#lg').innerHTML=lg||'<div>Žiadne držané pozície</div>';
 $('#tb').innerHTML=L.map(p=>{const d=(c,f)=>Number.isFinite(f)&&f>0?`<small class="${cls(c-f)==='pos'?'neg':'pos'}">${pct((c/f-1)*100,1)}</small>`:'';
-return`<tr><td data-l="Ticker"><b>${esc(p.t)}</b></td><td data-l="Firma"><span>${esc(p.n)}</span><small>${esc(p.s)}</small></td><td data-l="Aktuálna cena">${p.sold?'–':money(p.c)}</td><td data-l="Férová cena">${money(p.f)}${p.sold?'':d(p.c,p.f)}</td><td data-l="Priemer 5 rokov">${money(p.a)}${p.sold?'':d(p.c,p.a)}</td><td data-l="Nákupná cena">${money(p.b)}</td><td data-l="Predajná cena">${p.sold?money(p.x):'N/A'}</td><td data-l="Zisk / strata" class="${cls(p.pl)}"><b>${p.pl>=0?'▲':'▼'} ${pct(p.pl,1)}</b></td><td data-l="Yield on Cost">${pct(p.yoc)}</td></tr>`}).join('')||'<tr><td>Portfólio je prázdne. Pridaj prvú akciu.</td></tr>';
+return`<tr><td data-l="Ticker"><b>${esc(p.t)}</b></td><td data-l="Firma"><span>${esc(p.n)}</span><small>${esc(p.s)}</small></td><td data-l="Aktuálna cena">${p.sold?'–':money(p.c)}</td><td data-l="Férová cena">${money(p.f)}${p.sold?'':d(p.c,p.f)}</td><td data-l="Priemer 5 rokov">${money(p.a)}${p.sold?'':d(p.c,p.a)}</td><td data-l="Nákupná cena">${money(p.b)}</td><td data-l="Predajná cena">${p.sold?money(p.x):'N/A'}</td><td data-l="Zisk / strata" class="${cls(p.pl)}"><b>${p.pl>=0?'▲':'▼'} ${pct(p.pl,1)}</b></td><td data-l="Yield on Cost">${pct(p.yoc)}</td><td data-l=""><button class="ic" data-e="${p.i}" aria-label="Upraviť">✎</button><button class="ic" data-d="${p.i}" aria-label="Odstrániť">✕</button></td></tr>`}).join('')||'<tr><td colspan="10" style="text-align:center;color:var(--mut)">Portfólio je prázdne. Klikni na „+ Pridať akciu“.</td></tr>';
 const tip=$('#tip'),w=ch.parentNode,c1=$('#c1'),c2=$('#c2'),b0=money(hi);
 ch.onmouseover=ch.onmousemove=e=>{const s=e.target.closest('.seg');if(!s)return;ch.classList.add('h');ch.querySelectorAll('.seg').forEach(x=>x.classList.toggle('on',x===s||x.dataset.g===s.dataset.g&&(s.dataset.t===s.dataset.g||x.dataset.t===x.dataset.g)));
 const r=w.getBoundingClientRect();tip.innerHTML=`<b>${esc(s.dataset.t)}</b><br>Investovaná suma: ${money(+s.dataset.a)}<br>Podiel z portfólia: ${pct(+s.dataset.p)}`;tip.style.left=Math.min(e.clientX-r.left+14,r.width-190)+'px';tip.style.top=e.clientY-r.top+14+'px';tip.style.opacity=1;c1.textContent=s.dataset.t.split(' · ')[0];c2.textContent=money(+s.dataset.a)};
 ch.onmouseleave=()=>{ch.classList.remove('h');tip.style.opacity=0;c1.textContent='Investované';c2.textContent=b0}}
 render();
 const dlg=$('#dlg'),f=$('#f');
-$('#add').onclick=()=>{f.reset();dlg.showModal()};$('#cx').onclick=()=>dlg.close();
+let ed=null;const K=['t','n','s','q','b','c','f','a','x','d'];
+$('#add').onclick=()=>{ed=null;f.reset();$('#ttl').textContent='Nová akcia';dlg.showModal()};
+$('#tb').onclick=e=>{const b=e.target.closest('button');if(!b)return;
+if(b.dataset.e!==undefined){ed=+b.dataset.e;const p=S[ed];f.reset();K.forEach(k=>{f.elements[k].value=p[k]==null||(k==='d'&&!p[k])?'':p[k]});$('#ttl').textContent='Upraviť akciu';dlg.showModal()}
+else if(b.dataset.d!==undefined){if(b.classList.contains('x')){S.splice(+b.dataset.d,1);save();render()}else{b.classList.add('x');b.textContent='Naozaj?';setTimeout(()=>{if(b.isConnected){b.classList.remove('x');b.textContent='✕'}},3000)}}};$('#cx').onclick=()=>dlg.close();
 f.onsubmit=e=>{e.preventDefault();const v=Object.fromEntries(new FormData(f)),n=k=>v[k]===''?null:+v[k];
-S.push({t:v.t.trim().toUpperCase(),n:v.n.trim()||v.t.trim().toUpperCase(),s:v.s.trim(),q:n('q'),b:n('b'),c:n('c'),f:n('f'),a:n('a'),x:n('x'),d:n('d')||0});save();dlg.close();render()};
-$('#clr').onclick=()=>{S=[];save();render()};
+const o={t:v.t.trim().toUpperCase(),n:v.n.trim()||v.t.trim().toUpperCase(),s:v.s.trim(),q:n('q'),b:n('b'),c:n('c'),f:n('f'),a:n('a'),x:n('x'),d:n('d')||0};if(ed!==null)S[ed]=o;else S.push(o);save();dlg.close();render()};
 </script>
 </body>
 </html>

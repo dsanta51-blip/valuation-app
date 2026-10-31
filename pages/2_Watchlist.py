@@ -1,346 +1,136 @@
 """
-Watchlist – sledované a plánované nákupy
+Portfólio dashboard (pages/2_Watchlist.py): tabuľka pozícií, dvojvrstvový donut sektor/akcia, KPI karty a pridanie akcie.
+Ceny zadávaš ručne; dáta sa ukladajú v prehliadači (localStorage). Nové knižnice netreba.
+"""
+import streamlit as st
+import streamlit.components.v1 as components
 
-Umiestnenie v repozitári:  pages/2_Watchlist.py   (Streamlit ho sám pridá do menu vľavo)
-Hlavný súbor valuation_app.py a Screener sa nemenia. Nové knižnice netreba.
+st.set_page_config(page_title="Portfólio", page_icon="📈", layout="wide")
 
-Čo robí: do tabuľky zapíšeš ticker, férovú cenu (z hlavnej aplikácie), svoj margin of safety a/alebo vlastnú cieľovú
-nákupnú cenu. Stránka načíta živé ceny z Yahoo a pri každej akcii ukáže stav:
-🟢 NÁKUP (cena je na alebo pod nákupnou cenou), 🟡 BLÍZKO, ⚪ čakám.
-
-DÔLEŽITÉ:
-- Upozornenie funguje len, keď je táto stránka otvorená v prehliadači (aplikácia nevie poslať správu, keď je zatvorená).
-- Dáta sa ukladajú do súboru watchlist.csv v aplikácii. Na Streamlit Cloud sa po reštarte môže stratiť,
-  preto si pravidelne sťahuj zálohu (CSV) a po reštarte ju nahraj.
+HTML = r"""<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Portfólio akcií</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f4f5f8;--card:#fff;--text:#111827;--mut:#6b7280;--line:#e5e7eb;--acc:#4f46e5;--pos:#0f9d58;--neg:#d93025;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0b0f17;--card:#131a28;--text:#e6e9f0;--mut:#8b93a7;--line:#232c40;--acc:#8b92ff;--pos:#34d399;--neg:#f87171;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0b0f17;--card:#131a28;--text:#e6e9f0;--mut:#8b93a7;--line:#232c40;--acc:#8b92ff;--pos:#34d399;--neg:#f87171;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Inter,system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);background:var(--bg);z-index:10}
+header{position:sticky;top:env(safe-area-inset-top,0px);z-index:9;background:var(--bg);display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0}
+h2{font-size:14px;margin:0 0 12px;color:var(--mut);font-weight:600}
+main{max-width:1200px;margin:0 auto;padding:20px;display:grid;gap:16px}
+.btn{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:9px 16px;font:600 14px inherit;cursor:pointer}
+.btn.g{background:transparent;color:var(--mut);border:1px solid var(--line)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
+.kpi small{color:var(--mut);display:block}
+.kpi b{font-size:26px;display:block;margin:4px 0 2px;letter-spacing:-.5px}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+.donut{display:grid;grid-template-columns:minmax(0,420px) 1fr;gap:20px;align-items:center}
+.dw{position:relative}
+svg{width:100%;height:auto;display:block}
+.seg{stroke:var(--card);stroke-width:2;transition:opacity .15s}
+svg.h .seg:not(.on){opacity:.25}
+#tip{position:absolute;pointer-events:none;background:var(--text);color:var(--bg);padding:8px 10px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .1s;white-space:nowrap;z-index:5}
+.lg div{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
+.lg i{width:10px;height:10px;border-radius:50%}.lg span{margin-left:auto;color:var(--mut)}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:900px}
+th,td{padding:10px 8px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--mut);font-weight:500;font-size:12px}
+th:nth-child(-n+2),td:nth-child(-n+2){text-align:left}
+td small{display:block;color:var(--mut)}
+dialog{border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--text);padding:20px;width:min(480px,92vw)}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+form{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+label{font-size:12px;color:var(--mut);display:grid;gap:4px}
+label.w,.act{grid-column:1/-1}
+input{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit;width:100%}
+.act{display:flex;gap:8px;justify-content:flex-end}
+@media (max-width:820px){.donut{grid-template-columns:1fr}main{padding:12px}}
+@media (max-width:640px){table,tbody,tr,td{display:block;min-width:0}thead{display:none}tr{padding:10px 0;border-bottom:1px solid var(--line)}td{display:flex;justify-content:space-between;border:0;padding:3px 0}td::before{content:attr(data-l);color:var(--mut)}td small{display:none}}
+</style>
+</head>
+<body>
+<header><h1>📈 Portfólio akcií</h1><div><button class="btn g" id="clr">Vymazať ukážkové dáta</button> <button class="btn" id="add">+ Pridať akciu</button></div></header>
+<main>
+<section class="kpis">
+<div class="card kpi"><small>Celková hodnota portfólia</small><b id="k1">–</b><small id="k1s"></small></div>
+<div class="card kpi"><small>Celkový zisk / strata</small><b id="k2">–</b><small id="k2s"></small></div>
+<div class="card kpi"><small>Najvýnosnejší sektor</small><b id="k3">–</b><small id="k3s"></small></div>
+</section>
+<section class="card"><h2>Rozloženie investovaného kapitálu: vnútorný kruh sektory, vonkajší akcie</h2>
+<div class="donut"><div class="dw"><svg id="ch" viewBox="0 0 400 400" role="img" aria-label="Dvojvrstvový kruhový graf portfólia"></svg><div id="tip"></div></div><div class="lg" id="lg"></div></div></section>
+<section class="card"><h2>Pozície</h2><div class="tw"><table><thead><tr><th>Ticker</th><th>Firma a sektor</th><th>Aktuálna cena</th><th>Férová cena</th><th>Priemer 5 rokov</th><th>Nákupná cena</th><th>Predajná cena</th><th>Zisk / strata</th><th>Yield on Cost</th></tr></thead><tbody id="tb"></tbody></table></div>
+<p style="color:var(--mut);font-size:12px;margin:12px 0 0">Ceny zadávaš ručne a ukladajú sa len v tomto prehliadači. Ukážkové čísla nie sú živé kotácie.</p></section>
+</main>
+<dialog id="dlg"><form id="f" method="dialog"><h2 class="w" style="grid-column:1/-1">Nová akcia</h2>
+<label>Ticker<input name="t" required maxlength="12"></label><label>Názov firmy<input name="n"></label>
+<label class="w">Sektor<input name="s" list="sl" required><datalist id="sl"><option value="Technológie"><option value="Zdravotníctvo"><option value="Spotrebný tovar"><option value="Financie"><option value="Energetika"><option value="Priemysel"></datalist></label>
+<label>Počet kusov<input name="q" type="number" step="any" min="0" required></label><label>Nákupná cena ($)<input name="b" type="number" step="any" min="0" required></label>
+<label>Aktuálna cena ($)<input name="c" type="number" step="any" min="0" required></label><label>Férová cena ($)<input name="f" type="number" step="any" min="0"></label>
+<label>Priemerná cena 5 r. ($)<input name="a" type="number" step="any" min="0"></label><label>Predajná cena ($, ak predané)<input name="x" type="number" step="any" min="0"></label>
+<label class="w">Ročná dividenda na akciu ($)<input name="d" type="number" step="any" min="0"></label>
+<div class="act"><button class="btn g" type="button" id="cx">Zrušiť</button><button class="btn" type="submit">Uložiť</button></div></form></dialog>
+<script>
+const NB='\u00A0',nf=new Intl.NumberFormat('sk-SK',{minimumFractionDigits:2,maximumFractionDigits:2});
+const $=s=>document.querySelector(s),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money=v=>Number.isFinite(v)?nf.format(v)+NB+'$':'–',pct=(v,s)=>Number.isFinite(v)?(s&&v>0?'+':'')+nf.format(v)+NB+'%':'–';
+const DEMO=[
+{t:'AAPL',n:'Apple Inc.',s:'Technológie',q:20,b:150,c:225,f:210,a:165,x:null,d:1},
+{t:'MSFT',n:'Microsoft Corp.',s:'Technológie',q:10,b:300,c:420,f:400,a:330,x:null,d:3.3},
+{t:'GOOGL',n:'Alphabet Inc.',s:'Technológie',q:12,b:120,c:170,f:185,a:135,x:null,d:.8},
+{t:'JNJ',n:'Johnson & Johnson',s:'Zdravotníctvo',q:25,b:150,c:160,f:175,a:160,x:null,d:4.9},
+{t:'ABBV',n:'AbbVie Inc.',s:'Zdravotníctvo',q:12,b:140,c:190,f:180,a:150,x:null,d:6.4},
+{t:'PG',n:'Procter & Gamble',s:'Spotrebný tovar',q:18,b:140,c:165,f:160,a:150,x:null,d:4},
+{t:'KO',n:'Coca-Cola Co.',s:'Spotrebný tovar',q:40,b:58,c:62,f:65,a:59,x:null,d:1.9},
+{t:'NKE',n:'Nike Inc.',s:'Spotrebný tovar',q:15,b:130,c:80,f:100,a:110,x:95,d:1.5}];
+let S=null;try{S=JSON.parse(localStorage.getItem('pf1'))}catch(e){}
+if(!Array.isArray(S))S=DEMO.slice();
+const save=()=>{try{localStorage.setItem('pf1',JSON.stringify(S))}catch(e){}};
+const HUE=[226,160,28,330,270,190,50,0];
+function arc(r0,r1,a0,a1){if(a1-a0>6.283)a1=a0+6.283;const P=(r,a)=>(200+r*Math.cos(a)).toFixed(2)+','+(200+r*Math.sin(a)).toFixed(2),l=a1-a0>Math.PI?1:0;
+return`M${P(r1,a0)}A${r1} ${r1} 0 ${l} 1 ${P(r1,a1)}L${P(r0,a1)}A${r0} ${r0} 0 ${l} 0 ${P(r0,a0)}Z`}
+function render(){
+const L=S.map(p=>{const sold=p.x>0,inv=p.q*p.b,val=p.q*(sold?p.x:p.c);return{...p,sold,inv,val,pl:(val/inv-1)*100,yoc:p.d>0?p.d/p.b*100:NaN}}).filter(p=>p.inv>0);
+const held=L.filter(p=>!p.sold),tot=held.reduce((a,p)=>a+p.q*p.c,0),inv=L.reduce((a,p)=>a+p.inv,0),val=L.reduce((a,p)=>a+p.val,0);
+const sc=[...new Set(L.map(p=>p.s))],cls=v=>v>=0?'pos':'neg';
+$('#k1').textContent=money(tot);$('#k1s').textContent=held.length+' držaných pozícií';
+const pl=inv?(val/inv-1)*100:NaN;$('#k2').textContent=pct(pl,1);$('#k2').className=cls(pl);$('#k2s').textContent=money(val-inv)+' (vrátane predaných)';
+let best=null;sc.forEach(s=>{const g=L.filter(p=>p.s===s),i=g.reduce((a,p)=>a+p.inv,0),v=g.reduce((a,p)=>a+p.val,0),r=(v/i-1)*100;if(!best||r>best.r)best={s,r}});
+$('#k3').textContent=best?best.s:'–';$('#k3s').textContent=best?pct(best.r,1):'';
+const hi=held.reduce((a,p)=>a+p.inv,0),secs=sc.map(s=>({s,items:held.filter(p=>p.s===s).sort((a,b)=>b.inv-a.inv),h:HUE[sc.indexOf(s)%8]})).filter(g=>g.items.length);
+secs.forEach(g=>g.amt=g.items.reduce((a,p)=>a+p.inv,0));secs.sort((a,b)=>b.amt-a.amt);
+let a=-Math.PI/2,h='',lg='';
+secs.forEach(g=>{const a0=a,P=g.amt/hi;
+g.items.forEach((p,i)=>{const sp=p.inv/hi*6.2832,l=52+14*i/Math.max(g.items.length-1,1);
+h+=`<path class="seg" data-g="${esc(g.s)}" data-t="${esc(p.t+' · '+p.n)}" data-a="${p.inv}" data-p="${p.inv/hi*100}" fill="hsl(${g.h} 70% ${l}%)" d="${arc(122,172,a,a+sp)}"/>`;a+=sp});
+h+=`<path class="seg" data-g="${esc(g.s)}" data-t="${esc(g.s)}" data-a="${g.amt}" data-p="${P*100}" fill="hsl(${g.h} 70% 45%)" d="${arc(76,116,a0,a)}"/>`;
+lg+=`<div><i style="background:hsl(${g.h} 70% 45%)"></i>${esc(g.s)}<span>${money(g.amt)} · ${pct(P*100)}</span></div>`});
+const ch=$('#ch');ch.innerHTML=h+`<text x="200" y="192" text-anchor="middle" fill="var(--mut)" font-size="13" id="c1">Investované</text><text x="200" y="218" text-anchor="middle" fill="var(--text)" font-size="20" font-weight="700" id="c2">${money(hi)}</text>`;
+$('#lg').innerHTML=lg||'<div>Žiadne držané pozície</div>';
+$('#tb').innerHTML=L.map(p=>{const d=(c,f)=>Number.isFinite(f)&&f>0?`<small class="${cls(c-f)==='pos'?'neg':'pos'}">${pct((c/f-1)*100,1)}</small>`:'';
+return`<tr><td data-l="Ticker"><b>${esc(p.t)}</b></td><td data-l="Firma"><span>${esc(p.n)}</span><small>${esc(p.s)}</small></td><td data-l="Aktuálna cena">${p.sold?'–':money(p.c)}</td><td data-l="Férová cena">${money(p.f)}${p.sold?'':d(p.c,p.f)}</td><td data-l="Priemer 5 rokov">${money(p.a)}${p.sold?'':d(p.c,p.a)}</td><td data-l="Nákupná cena">${money(p.b)}</td><td data-l="Predajná cena">${p.sold?money(p.x):'N/A'}</td><td data-l="Zisk / strata" class="${cls(p.pl)}"><b>${p.pl>=0?'▲':'▼'} ${pct(p.pl,1)}</b></td><td data-l="Yield on Cost">${pct(p.yoc)}</td></tr>`}).join('')||'<tr><td>Portfólio je prázdne. Pridaj prvú akciu.</td></tr>';
+const tip=$('#tip'),w=ch.parentNode,c1=$('#c1'),c2=$('#c2'),b0=money(hi);
+ch.onmouseover=ch.onmousemove=e=>{const s=e.target.closest('.seg');if(!s)return;ch.classList.add('h');ch.querySelectorAll('.seg').forEach(x=>x.classList.toggle('on',x===s||x.dataset.g===s.dataset.g&&(s.dataset.t===s.dataset.g||x.dataset.t===x.dataset.g)));
+const r=w.getBoundingClientRect();tip.innerHTML=`<b>${esc(s.dataset.t)}</b><br>Investovaná suma: ${money(+s.dataset.a)}<br>Podiel z portfólia: ${pct(+s.dataset.p)}`;tip.style.left=Math.min(e.clientX-r.left+14,r.width-190)+'px';tip.style.top=e.clientY-r.top+14+'px';tip.style.opacity=1;c1.textContent=s.dataset.t.split(' · ')[0];c2.textContent=money(+s.dataset.a)};
+ch.onmouseleave=()=>{ch.classList.remove('h');tip.style.opacity=0;c1.textContent='Investované';c2.textContent=b0}}
+render();
+const dlg=$('#dlg'),f=$('#f');
+$('#add').onclick=()=>{f.reset();dlg.showModal()};$('#cx').onclick=()=>dlg.close();
+f.onsubmit=e=>{e.preventDefault();const v=Object.fromEntries(new FormData(f)),n=k=>v[k]===''?null:+v[k];
+S.push({t:v.t.trim().toUpperCase(),n:v.n.trim()||v.t.trim().toUpperCase(),s:v.s.trim(),q:n('q'),b:n('b'),c:n('c'),f:n('f'),a:n('a'),x:n('x'),d:n('d')||0});save();dlg.close();render()};
+$('#clr').onclick=()=>{S=[];save();render()};
+</script>
+</body>
+</html>
 """
 
-import os
-import re
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-
-import numpy as np
-import pandas as pd
-import streamlit as st
-import yfinance as yf
-
-st.set_page_config(page_title="Watchlist", page_icon="🔔", layout="wide")
-
-WL_FILE = "watchlist.csv"
-COLS = ["Ticker", "Typ", "Férová cena", "Dátum FV", "MoS %", "Cieľová cena", "Moja nákupná cena", "Poznámka"]
-NUM_COLS = ["Férová cena", "MoS %", "Cieľová cena", "Moja nákupná cena"]
-TYPES = ["Nákup", "Sledujem"]
-REFRESH = {"Vypnuté": 0, "1 min": 60, "5 min": 300, "15 min": 900}
-TICKER_RE = re.compile(r"^[A-Z0-9.\-^=]{1,12}$")
-
-
-def sf(x, default=np.nan) -> float:
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        return v if np.isfinite(v) else default
-    except Exception:
-        return default
-
-
-# ----------------------------------------------------------------------------
-# ZOZNAM: načítanie, čistenie, ukladanie
-# ----------------------------------------------------------------------------
-def normalize(df) -> pd.DataFrame:
-    df = pd.DataFrame() if df is None else df.copy()
-    for c in COLS:
-        if c not in df.columns:
-            df[c] = np.nan
-    df = df[COLS]
-    df["Ticker"] = df["Ticker"].fillna("").astype(str).str.strip().str.upper()
-    df["Typ"] = df["Typ"].where(df["Typ"].isin(TYPES), "Nákup")
-    for c in NUM_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Dátum FV"] = pd.to_datetime(df["Dátum FV"], errors="coerce")
-    df["Poznámka"] = df["Poznámka"].fillna("").astype(str)
-    empty = (df["Ticker"] == "") & df[NUM_COLS].isna().all(axis=1)
-    return df[~empty].reset_index(drop=True)
-
-
-def load_local():
-    try:
-        if os.path.exists(WL_FILE):
-            return pd.read_csv(WL_FILE)
-    except Exception:
-        pass
-    return None
-
-
-def save_local(df: pd.DataFrame) -> bool:
-    try:
-        df.to_csv(WL_FILE, index=False)
-        return True
-    except Exception:
-        return False
-
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    out = df.copy()
-    out["Dátum FV"] = out["Dátum FV"].dt.strftime("%Y-%m-%d")
-    return out.to_csv(index=False).encode("utf-8-sig")
-
-
-# ----------------------------------------------------------------------------
-# CENY (Yahoo): živá cena krátko v cache, história na priemer dlhšie
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=60, show_spinner=False)
-def get_quotes(symbols: tuple) -> dict:
-    def one(sym):
-        out = dict(price=np.nan, prev=np.nan, cur="")
-        try:
-            fi = yf.Ticker(sym).fast_info
-            out["price"] = sf(fi["last_price"])
-            out["prev"] = sf(fi["previous_close"])
-            out["cur"] = str(fi["currency"] or "")
-        except Exception:
-            pass
-        return sym, out
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return dict(ex.map(one, symbols))
-
-
-@st.cache_data(ttl=3 * 3600, show_spinner=False)
-def get_history_stats(symbols: tuple) -> dict:
-    def one(sym):
-        out = dict(avg5=np.nan, last=np.nan)
-        try:
-            c = yf.Ticker(sym).history(period="5y", auto_adjust=False)["Close"].dropna()
-            if len(c):
-                out.update(avg5=float(c.mean()), last=float(c.iloc[-1]))
-        except Exception:
-            pass
-        return sym, out
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        return dict(ex.map(one, symbols))
-
-
-# ----------------------------------------------------------------------------
-# VÝPOČET STAVU
-# ----------------------------------------------------------------------------
-def status_for(price, buy, near_pct):
-    if not np.isfinite(price):
-        return 4, "⚠️ bez ceny"
-    if not np.isfinite(buy):
-        return 3, "ℹ️ doplň cieľ alebo FV"
-    if price <= buy:
-        return 0, "🟢 NÁKUP"
-    if price <= buy * (1 + near_pct / 100):
-        return 1, "🟡 BLÍZKO"
-    return 2, "⚪ čakám"
-
-
-def build_table(df: pd.DataFrame, quotes: dict, hist: dict, p: dict) -> pd.DataFrame:
-    rows = []
-    today = pd.Timestamp.now().normalize()
-    for _, r in df.iterrows():
-        sym = r["Ticker"]
-        q, h = quotes.get(sym, {}), hist.get(sym, {})
-        scale = 0.01 if q.get("cur") == "GBp" else 1.0           # Londýn: pence → libry
-        price, note_src = sf(q.get("price")) * scale, ""
-        if not np.isfinite(price):
-            price, note_src = sf(h.get("last")) * scale, "posledné zatvorenie"
-        prev = sf(q.get("prev")) * scale
-        avg5 = sf(h.get("avg5")) * scale
-        fv = r["Férová cena"] if np.isfinite(r["Férová cena"]) and r["Férová cena"] > 0 else np.nan
-        mos = r["MoS %"] if np.isfinite(r["MoS %"]) and 0 <= r["MoS %"] < 100 else p["mos"]
-        target = r["Cieľová cena"] if np.isfinite(r["Cieľová cena"]) and r["Cieľová cena"] > 0 else np.nan
-        buy_fv = fv * (1 - mos / 100) if np.isfinite(fv) else np.nan
-        buy = target if np.isfinite(target) else buy_fv
-        src = "vlastná cieľová" if np.isfinite(target) else (f"FV × (1 − {mos:.0f} %)" if np.isfinite(buy_fv) else "")
-        prio, label = status_for(price, buy, p["near"])
-        if note_src:   # živá cena chýba: upozornenie na nákup nespúšťame zo starej ceny
-            prio, label = 4, "⚠️ bez živej ceny"
-
-        warn = []
-        if note_src:
-            warn.append("cena = posledné zatvorenie")
-        if np.isfinite(fv):
-            if pd.isna(r["Dátum FV"]):
-                warn.append("⏰ FV bez dátumu")
-            elif (today - r["Dátum FV"]).days > p["stale"]:
-                warn.append(f"⏰ FV stará {(today - r['Dátum FV']).days} dní – prepočítaj")
-            if np.isfinite(price) and price > fv:
-                warn.append("cena nad férovou")
-        mine = r["Moja nákupná cena"]
-        rows.append({
-            "_prio": prio, "_dist": (price / buy - 1) * 100 if np.isfinite(price) and np.isfinite(buy) else np.inf,
-            "Ticker": sym, "Typ": r["Typ"], "Cena": price, "Mena": ("GBP" if q.get("cur") == "GBp" else q.get("cur", "")),
-            "Zmena %": (price / prev - 1) * 100 if np.isfinite(price) and np.isfinite(prev) and prev > 0 else np.nan,
-            "Priem. cena 5r": avg5,
-            "Cena vs priem. %": (price / avg5 - 1) * 100 if np.isfinite(price) and np.isfinite(avg5) and avg5 > 0 else np.nan,
-            "Férová cena": fv,
-            "MoS dnes %": (1 - price / fv) * 100 if np.isfinite(price) and np.isfinite(fv) else np.nan,
-            "Nákupná cena": buy, "Zdroj hranice": src,
-            "Do hranice %": (price / buy - 1) * 100 if np.isfinite(price) and np.isfinite(buy) else np.nan,
-            "Stav": label, "Upozornenia": ", ".join(warn),
-            "P/L %": (price / mine - 1) * 100 if np.isfinite(price) and np.isfinite(mine) and mine > 0 else np.nan,
-            "Poznámka": r["Poznámka"],
-        })
-    t = pd.DataFrame(rows)
-    return t.sort_values(["_prio", "_dist"], kind="stable").reset_index(drop=True) if not t.empty else t
-
-
-def style_table(t: pd.DataFrame):
-    show = t.drop(columns=["_prio", "_dist"])
-
-    def color(row):
-        if "NÁKUP" in row["Stav"]:
-            css = "background-color:#c8efd3;color:#111111;font-weight:600"
-        elif "BLÍZKO" in row["Stav"]:
-            css = "background-color:#fde2b8;color:#111111"
-        else:
-            css = ""
-        return [css] * len(row)
-
-    fmt = {"Cena": "{:,.2f}", "Priem. cena 5r": "{:,.2f}", "Férová cena": "{:,.2f}", "Nákupná cena": "{:,.2f}",
-           "Zmena %": "{:+.1f}", "Cena vs priem. %": "{:+.1f}", "MoS dnes %": "{:+.1f}", "Do hranice %": "{:+.1f}",
-           "P/L %": "{:+.1f}"}
-    return show.style.apply(color, axis=1).format(fmt, na_rep="–")
-
-
-def dashboard(df: pd.DataFrame, p: dict):
-    symbols = tuple(sorted({s for s in df["Ticker"] if TICKER_RE.match(s)}))
-    quotes, hist = get_quotes(symbols), get_history_stats(symbols)
-    t = build_table(df, quotes, hist, p)
-    if t.empty:
-        return
-
-    n_buy, n_near, n_wait = int((t["_prio"] == 0).sum()), int((t["_prio"] == 1).sum()), int((t["_prio"] == 2).sum())
-    n_miss = int((t["_prio"] >= 3).sum())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🟢 Na nákupnej cene", n_buy)
-    c2.metric("🟡 Blízko", n_near)
-    c3.metric("⚪ Čakám", n_wait)
-    c4.metric("⚠️ Chýbajú údaje", n_miss)
-
-    hit = t[t["_prio"] == 0]
-    if not hit.empty:
-        st.success("🔔 **NA NÁKUPNEJ CENE:** " + " · ".join(
-            f"**{r['Ticker']}** {r['Cena']:,.2f} ≤ {r['Nákupná cena']:,.2f}" for _, r in hit.iterrows()))
-    close = t[t["_prio"] == 1]
-    if not close.empty:
-        st.warning("🟡 **Blízko nákupnej ceny:** " + " · ".join(
-            f"**{r['Ticker']}** {r['Cena']:,.2f} (do hranice {r['Do hranice %']:+.1f} %)" for _, r in close.iterrows()))
-
-    # jednorazové oznámenie (toast) pre akcie, ktoré sa práve dostali na nákupnú cenu
-    seen = st.session_state.get("wl_toasted", set())
-    now_green = set(hit["Ticker"])
-    for sym in sorted(now_green - seen):
-        try:
-            st.toast(f"🔔 {sym} je na nákupnej cene", icon="🟢")
-        except Exception:
-            pass
-    st.session_state["wl_toasted"] = now_green
-
-    st.dataframe(style_table(t), use_container_width=True, hide_index=True)
-    used_close = [r.Ticker for r in t.itertuples() if "posledné zatvorenie" in r.Upozornenia]
-    st.caption(f"Ceny z Yahoo Finance, aktualizované {datetime.now().strftime('%H:%M:%S')} (Yahoo môže meškať až 15 minút; "
-               f"živá cena sa cachuje 60 s). Priemerná cena = jednoduchý priemer zatváracích cien za 5 rokov."
-               + (f" Pri {', '.join(used_close)} chýba živá cena, použité je posledné zatvorenie." if used_close else ""))
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-st.title("🔔 Watchlist – sledované a plánované nákupy")
-st.caption("Zapíš si akcie, férovú cenu a svoj margin of safety. Stránka ukáže, ktoré sú na nákupnej cene. "
-           "Férovú cenu si prenes z hlavnej aplikácie (vo rovnakej mene ako cena akcie).")
-st.warning("⚠️ **Upozornenie funguje len, keď je táto stránka otvorená.** Dáta sa ukladajú v aplikácii, kde sa po reštarte "
-           "môžu stratiť. Pravidelne si stiahni zálohu (CSV) a po reštarte ju nahraj.")
-
-with st.sidebar:
-    st.header("⚙️ Nastavenia")
-    default_mos = st.number_input("Predvolený margin of safety (%)", min_value=0.0, max_value=90.0, value=15.0, step=1.0,
-                                  key="wl_mos", help="Použije sa, ak pri akcii nezadáš vlastný MoS.")
-    near = st.number_input("„Blízko“ = do (%) nad nákupnou cenou", min_value=0.0, max_value=50.0, value=5.0, step=1.0,
-                           key="wl_near")
-    stale = st.number_input("Férová cena je stará po (dňoch)", min_value=7, max_value=720, value=90, step=7, key="wl_stale")
-    refresh_label = st.selectbox("Automatické obnovovanie cien", list(REFRESH.keys()), index=2, key="wl_refresh")
-    if st.button("🔄 Obnoviť ceny teraz", key="wl_reload"):
-        st.cache_data.clear()
-        st.rerun()
-
-p = dict(mos=default_mos, near=near, stale=int(stale), refresh=REFRESH[refresh_label])
-
-# počiatočný stav: súbor v aplikácii (ak existuje)
-if "wl_base" not in st.session_state:
-    st.session_state["wl_base"] = normalize(load_local())
-    st.session_state["wl_ver"] = 0
-
-up = st.file_uploader("Nahrať zálohu (CSV)", type="csv", key="wl_upload")
-if up is not None:
-    sig = (up.name, up.size)
-    if st.session_state.get("wl_up_sig") != sig:
-        try:
-            loaded = normalize(pd.read_csv(up))
-            st.session_state["wl_base"] = loaded
-            st.session_state["wl_ver"] += 1
-            st.session_state["wl_up_sig"] = sig
-            st.success(f"Načítaných {len(loaded)} riadkov zo zálohy.")
-        except Exception as e:
-            st.error(f"Zálohu sa nepodarilo načítať: {e}")
-
-st.markdown("### 📝 Zoznam")
-st.caption("Klikni do tabuľky a pridaj riadok (dole). Nákupná cena = tvoja cieľová cena, ak ju zadáš, inak "
-           "férová cena × (1 − MoS). Dátum FV ti pomôže odhaliť zastaranú férovú cenu.")
-cfg = {
-    "Ticker": st.column_config.TextColumn("Ticker", help="napr. AAPL, MSFT, SAP.DE", required=True),
-    "Typ": st.column_config.SelectboxColumn("Typ", options=TYPES, required=True),
-    "Férová cena": st.column_config.NumberColumn("Férová cena", min_value=0.0, format="%.2f"),
-    "Dátum FV": st.column_config.DateColumn("Dátum odhadu FV"),
-    "MoS %": st.column_config.NumberColumn("Môj MoS %", min_value=0.0, max_value=95.0, format="%.0f",
-                                           help="Prázdne = predvolený MoS z bočného panela."),
-    "Cieľová cena": st.column_config.NumberColumn("Cieľová nákupná cena", min_value=0.0, format="%.2f",
-                                                  help="Ak vyplníš, použije sa namiesto FV × (1 − MoS)."),
-    "Moja nákupná cena": st.column_config.NumberColumn("Moja priemerná nákupná cena", min_value=0.0, format="%.2f",
-                                                       help="Len ak už akciu držíš; ukáže zisk alebo stratu v %."),
-    "Poznámka": st.column_config.TextColumn("Poznámka / dôvod"),
-}
-edited = st.data_editor(st.session_state["wl_base"], num_rows="dynamic", hide_index=True, use_container_width=True,
-                        column_config=cfg, key=f"wl_editor_{st.session_state['wl_ver']}")
-df = normalize(edited)
-
-bad = [s for s in df["Ticker"] if s and not TICKER_RE.match(s)]
-if bad:
-    st.error("Neplatný ticker: " + ", ".join(bad) + " (povolené sú písmená, čísla, bodka, pomlčka).")
-dups = df["Ticker"][df["Ticker"].duplicated() & (df["Ticker"] != "")].unique().tolist()
-if dups:
-    st.info("Ticker sa v zozname opakuje: " + ", ".join(dups))
-
-# ukladanie (do súboru v aplikácii) a záloha
-sig_now = to_csv_bytes(df)
-if st.session_state.get("wl_saved_sig") != sig_now:
-    saved = save_local(df)
-    st.session_state["wl_saved_sig"] = sig_now
-    st.session_state["wl_saved_at"] = datetime.now().strftime("%H:%M:%S") if saved else "nepodarilo sa uložiť"
-b1, b2 = st.columns([1, 3])
-b1.download_button("⬇️ Stiahnuť zálohu (CSV)", sig_now, file_name="watchlist.csv", mime="text/csv", key="wl_download")
-b2.caption(f"Posledné uloženie v aplikácii: {st.session_state.get('wl_saved_at', '–')}. "
-           "Záloha v počítači je jediné trvalé uloženie.")
-
-st.divider()
-if df.empty or (df["Ticker"] == "").all():
-    st.info("Zoznam je prázdny. Pridaj riadok do tabuľky vyššie (ticker a férová cena alebo cieľová cena).")
-    st.stop()
-
-work = df[df["Ticker"].apply(lambda s: bool(TICKER_RE.match(s)))]
-frag = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
-if p["refresh"] and frag is not None:
-    try:
-        frag(run_every=p["refresh"])(dashboard)(work, p)
-    except TypeError:
-        dashboard(work, p)
-else:
-    dashboard(work, p)
-
-st.caption("⚠️ Nie je to investičné odporúčanie. Férová cena je tvoj vlastný odhad: pri zastaranom odhade alebo zmene "
-           "firmy ju prepočítaj v hlavnej aplikácii.")
-
+components.html(HTML, height=1500, scrolling=True)
